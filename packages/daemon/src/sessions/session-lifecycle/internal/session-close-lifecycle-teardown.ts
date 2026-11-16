@@ -40,6 +40,7 @@ export type SessionCloseTeardownResult = Readonly<{
    * denies `device-shutdown`, so the device stays running. The close itself succeeded.
    */
   implicitShutdownDeniedByPolicy: boolean;
+  implicitShutdownClaimLost: boolean;
 }>;
 
 /** Runs owned resources, native close, native hint cleanup, and final lifecycle disposal. */
@@ -98,12 +99,15 @@ export async function runSessionCloseTeardown(params: {
   const bootOwnedLocalStop =
     session.bootedByOpen === true && lifecycle.owner.kind === 'local-family';
   const implicitShutdown = !explicitShutdown && bootOwnedLocalStop;
-  const implicitShutdownDeniedByPolicy = implicitShutdown && params.deviceShutdownDenied === true;
+  const claimRenewal = implicitShutdown
+    ? await renewDeviceClaim(session.deviceClaim, params.env)
+    : undefined;
+  const implicitShutdownClaimLost = claimRenewal?.status === 'lost';
+  const implicitShutdownDeniedByPolicy =
+    implicitShutdown && !implicitShutdownClaimLost && params.deviceShutdownDenied === true;
   const shutdownRequested =
     explicitShutdown ||
-    (implicitShutdown &&
-      !implicitShutdownDeniedByPolicy &&
-      (await renewDeviceClaim(session.deviceClaim, params.env)).status === 'renewed');
+    (implicitShutdown && !implicitShutdownDeniedByPolicy && claimRenewal?.status === 'renewed');
   const retainExecutionHost = params.platformResourceCleanup.retainExecutionHostAfterClose({
     device: session.device,
     shutdownRequested,
@@ -162,6 +166,7 @@ export async function runSessionCloseTeardown(params: {
     shutdownResult: finalization?.shutdown,
     shutdownPrepared: finalization !== undefined,
     implicitShutdownDeniedByPolicy,
+    implicitShutdownClaimLost,
   };
 }
 

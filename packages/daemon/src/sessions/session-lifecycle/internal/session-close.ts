@@ -368,6 +368,7 @@ export async function handleSessionCloseCommands(
     shutdownResult: closed.shutdownResult,
     providerData: closed.providerData,
     implicitShutdownDeniedByPolicy: closed.implicitShutdownDeniedByPolicy,
+    implicitShutdownClaimLost: closed.implicitShutdownClaimLost,
   });
   return remoteCloseScriptDelivery(response, closed.remoteScript);
 }
@@ -399,6 +400,7 @@ type SessionCloseFinalization =
       remoteScript?: RemoteCloseScript;
       /** #4162: the policy denied the stop this close owed its own boot, so the device kept running. */
       implicitShutdownDeniedByPolicy: boolean;
+      implicitShutdownClaimLost: boolean;
     };
 
 // Everything between a settled repair decision and a success response:
@@ -440,6 +442,7 @@ async function runCloseTeardownAndRelease(params: {
     shutdownPrepared,
     shutdownResult,
     implicitShutdownDeniedByPolicy,
+    implicitShutdownClaimLost,
   } = await runSessionCloseTeardown({
     env: params.env,
     leaseRegistry,
@@ -502,6 +505,7 @@ async function runCloseTeardownAndRelease(params: {
     shutdownResult: leaseRelease.shutdownResult ?? shutdownResult,
     remoteScript: saveScriptOutcome.remote,
     implicitShutdownDeniedByPolicy,
+    implicitShutdownClaimLost,
   };
 }
 
@@ -512,6 +516,7 @@ function buildCloseSuccessResponse(params: {
   shutdownResult: TargetShutdownResult | undefined;
   providerData: Record<string, unknown> | undefined;
   implicitShutdownDeniedByPolicy: boolean;
+  implicitShutdownClaimLost: boolean;
 }): DaemonResponse {
   const {
     session,
@@ -520,6 +525,7 @@ function buildCloseSuccessResponse(params: {
     shutdownResult,
     providerData,
     implicitShutdownDeniedByPolicy,
+    implicitShutdownClaimLost,
   } = params;
   if (repair.aborted && requestedSaveScript) {
     return {
@@ -550,6 +556,12 @@ function buildCloseSuccessResponse(params: {
     appendResponseWarning(
       data,
       "This session's open booted this device and close would stop it, but this daemon's policy denies device-shutdown. The device is still running.",
+    );
+  }
+  if (implicitShutdownClaimLost) {
+    appendResponseWarning(
+      data,
+      "This session's open booted this device, but close could not verify its device claim and did not request a stop.",
     );
   }
   return { ok: true, data };

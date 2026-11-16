@@ -14,6 +14,7 @@ import { lifecycleOperationsSpy } from '../../../../__tests__/support/lifecycle-
 import { platformResourceCleanupFixture } from '../../../../__tests__/support/platform-resource-cleanup-fixture.ts';
 import {
   acquireDeviceClaim,
+  clearDeviceClaim,
   inspectDeviceClaims,
 } from '@agent-device/daemon-contracts/device-claims';
 
@@ -69,7 +70,7 @@ async function closeSession(params: {
   const sessionStore = makeSessionStore();
   const session = makeSession(sessionName, device);
   if (bootedByOpen) session.bootedByOpen = bootedByOpen;
-  if (bootedByOpen && params.claim !== 'missing') {
+  if (bootedByOpen) {
     const claimInput = {
       env: host.env,
       device,
@@ -81,6 +82,9 @@ async function closeSession(params: {
     const acquired = await acquireDeviceClaim(claimInput);
     if (acquired.status !== 'acquired') throw new Error('Expected an owned device claim');
     session.deviceClaim = acquired.ownership;
+    if (params.claim === 'missing') {
+      await clearDeviceClaim(acquired.ownership, host.env);
+    }
     if (params.claim === 'successor') {
       const prior = inspectDeviceClaims({}, host.env)[0]?.claim;
       if (!prior) throw new Error('Expected the original claim');
@@ -122,18 +126,29 @@ async function closeSession(params: {
   return { response, sessionStore, claims: inspectDeviceClaims({}, host.env) };
 }
 
-test.each(['missing', 'successor'] as const)(
-  'plain close cannot stop a boot-owned device when its current claim is %s',
-  async (claim) => {
+test.each([
+  ['missing', false],
+  ['missing', true],
+  ['successor', false],
+  ['successor', true],
+] as const)(
+  'plain close cannot stop a boot-owned device when its current claim is %s and policy denial is %s',
+  async (claim, deviceShutdownDenied) => {
     const { loader, finalizeApplicationClose } = lifecycleOperationsSpy();
     const { response, sessionStore, claims } = await closeSession({
       sessionName: 'lost-claim-session',
       device: iosSimulator,
       bootedByOpen: true,
       claim,
+      deviceShutdownDenied,
       lifecycleOperationsLoader: loader,
     });
     expect(response?.ok).toBe(true);
+    if (response?.ok) {
+      expect(response.data?.warnings).toEqual([
+        "This session's open booted this device, but close could not verify its device claim and did not request a stop.",
+      ]);
+    }
     expect(finalizeApplicationClose).toHaveBeenCalledWith(
       expect.objectContaining({ shutdownTarget: false }),
     );
