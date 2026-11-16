@@ -46,6 +46,7 @@ import {
 // Readiness is package-owned; hold the open at the fixture's platform-neutral readiness gate.
 import { awaitFixtureReadiness } from '../../__tests__/support/application-lifecycle-runtime-fixture.ts';
 import { parseDaemonPolicy } from '@agent-device/daemon-contracts/daemon-policy-file';
+import { acquireDeviceClaim } from '@agent-device/daemon-contracts/device-claims';
 import { platformResourceCleanupFixture } from '../../__tests__/support/platform-resource-cleanup-fixture.ts';
 import { readResponseWarnings } from '@agent-device/kernel/success-text';
 import { toReplayTestAttemptOutcome } from '@agent-device/replay-port/session-test-outcome';
@@ -71,13 +72,27 @@ test.each([false, true])(
     const replayPath = path.join(root, 'close.ad');
     fs.writeFileSync(replayPath, laterFailure ? 'close\napp-switcher\n' : 'close\n');
     const sessionStore = makeSessionStore('agent-device-replay-close-policy-');
-    sessionStore.publish(
-      'default',
-      makeIosSession('default', { bootedByOpen: true, appBundleId: 'com.example.app' }),
-    );
+    const host = createTestHostEnvironment({
+      env: { ...process.env, AGENT_DEVICE_CLAIMS_DIR: path.join(root, 'claims') },
+    });
+    const session = makeIosSession('default', {
+      bootedByOpen: true,
+      appBundleId: 'com.example.app',
+    });
+    const claim = await acquireDeviceClaim({
+      env: host.env,
+      device: session.device,
+      session: 'default',
+      workspace: host.cwd,
+      stateDir: sessionStore.resolveDaemonStateDir(),
+      reconcileOrphanedDeviceClaim: async () => ({ status: 'reconciled' as const }),
+    });
+    if (claim.status !== 'acquired') throw new Error('Expected an owned device claim');
+    session.deviceClaim = claim.ownership;
+    sessionStore.publish('default', session);
     const cleanup = platformResourceCleanupFixture();
     const handler = createRequestHandler({
-      host: createTestHostEnvironment(),
+      host,
       createCommandSurface: testCreateCommandSurface,
       logPath: path.join(root, 'daemon.log'),
       token: 'test-token',
