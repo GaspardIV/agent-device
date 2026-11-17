@@ -1,11 +1,11 @@
 name: Coverage Probe
 
-# TEMPORARY. Manual-only measurement lane for the Coverage job's wall time: runner class, worker
-# count, and the cost of the coverage instrumentation itself. Delete once the Coverage job's shape
-# is settled from its numbers.
+# TEMPORARY. Measurement lane for the Coverage job's wall time: runner class, worker count, and the
+# cost of the coverage instrumentation itself. Delete once the Coverage job's shape is settled from
+# its numbers.
 
 on:
-  workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
