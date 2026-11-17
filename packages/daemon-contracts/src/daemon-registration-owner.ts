@@ -7,6 +7,7 @@ import type { EnvMap } from '@agent-device/kernel/source-value';
 import {
   stopDaemonProcess,
   waitForDaemonExit,
+  type DaemonGracefulShutdown,
   type DaemonTerminationResult,
 } from './daemon-process.ts';
 import {
@@ -437,6 +438,7 @@ export async function stopAndRetireDaemon(
       mode: 'graceful' | 'force';
       ownedStateDir?: OwnedReplayStateDir;
       startupJoinTimeoutMs?: number;
+      gracefulShutdown?: DaemonGracefulShutdown;
     }>,
 ): Promise<DaemonRetirementResult> {
   let owned: PrivateReplayState | undefined;
@@ -474,6 +476,7 @@ export async function stopAndRetireDaemon(
             mode: input.mode,
             termTimeoutMs: input.termTimeoutMs ?? 3_000,
             killTimeoutMs: input.killTimeoutMs ?? 1_000,
+            ...(input.gracefulShutdown ? { gracefulShutdown: input.gracefulShutdown } : {}),
           }),
     owned,
     input.startupJoinTimeoutMs ?? 1_000,

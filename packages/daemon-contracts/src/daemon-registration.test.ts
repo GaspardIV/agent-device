@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, test } from 'vitest';
 import {
   isSupersededDaemonOwner,
+  readDaemonStopIdentity,
   readRegisteredDaemonIdentity,
   readRegisteredDaemonOwnership,
 } from './daemon-registration.ts';
@@ -148,3 +149,69 @@ test.skipIf(process.getuid?.() === 0)(
     }
   },
 );
+
+test('readDaemonStopIdentity captures endpoint metadata only for detached records with valid port and token', () => {
+  const infoPath = infoPathOf(useStateDir());
+
+  fs.writeFileSync(
+    infoPath,
+    JSON.stringify({
+      pid: 4242,
+      processStartTime: 'start',
+      ownership: 'detached',
+      port: 4310,
+      httpPort: 4311,
+      transport: 'dual',
+      token: 'secret-token',
+      capabilities: ['quiesce', 'shutdown'],
+    }),
+  );
+  assert.deepEqual(readDaemonStopIdentity(infoPath), {
+    ownership: 'detached',
+    identity: { pid: 4242, startTime: 'start' },
+    endpoint: {
+      port: 4310,
+      httpPort: 4311,
+      transport: 'dual',
+      token: 'secret-token',
+      capabilities: ['quiesce', 'shutdown'],
+    },
+  });
+
+  fs.writeFileSync(
+    infoPath,
+    JSON.stringify({
+      pid: 4242,
+      processStartTime: 'start',
+      ownership: 'detached',
+      port: 70_000,
+      token: 'secret-token',
+      capabilities: ['shutdown'],
+    }),
+  );
+  assert.deepEqual(readDaemonStopIdentity(infoPath), {
+    ownership: 'detached',
+    identity: { pid: 4242, startTime: 'start' },
+  });
+
+  fs.writeFileSync(
+    infoPath,
+    JSON.stringify({
+      pid: 4242,
+      processStartTime: 'start',
+      ownership: 'embedded',
+      port: 4310,
+      token: 'secret-token',
+    }),
+  );
+  assert.deepEqual(readDaemonStopIdentity(infoPath), {
+    ownership: 'embedded',
+    identity: { pid: 4242, startTime: 'start' },
+  });
+
+  fs.writeFileSync(infoPath, JSON.stringify({ pid: 4242, processStartTime: 'start' }));
+  assert.deepEqual(readDaemonStopIdentity(infoPath), {
+    ownership: 'detached',
+    identity: { pid: 4242, startTime: 'start' },
+  });
+});

@@ -27,6 +27,7 @@ import { PUBLIC_COMMANDS } from '@agent-device/command-registry/catalog';
 
 import type { findUnrecoveredRepairCommitFailure } from '@agent-device/daemon-contracts/session-repair-tombstone';
 import type { DaemonInfo } from './daemon-client-metadata.ts';
+import { createGracefulDaemonShutdown } from './daemon-client-lifecycle-request.ts';
 import { attachActiveSessionAddressHint } from './daemon-client-address-hints.ts';
 import { isRemoteDaemon, observedDaemonIdentityOf } from './daemon-client-metadata.ts';
 import { cachedRemoteDaemonHealth } from './daemon-client-transport.ts';
@@ -344,11 +345,16 @@ export async function cleanupDaemonAfterRequest(
     return response;
   }
 
+  const gracefulShutdown = createGracefulDaemonShutdown(daemon.info, {
+    paths: settings.paths,
+    host: settings.host,
+  });
   const result = await stopAndRetireDaemon({
     paths: settings.paths,
     observed: observedDaemonIdentityOf(daemon.info),
     mode: 'graceful',
     ownedStateDir: settings.ownedStateDir,
+    ...(gracefulShutdown ? { gracefulShutdown } : {}),
   });
   emitDiagnostic({
     level: result.status === 'retained' ? 'warn' : 'info',

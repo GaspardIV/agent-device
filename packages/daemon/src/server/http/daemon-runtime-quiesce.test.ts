@@ -4,9 +4,11 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { createTestHostEnvironment, mkdtempForTestSync } from '@agent-device/test-kit';
 import {
   buildDaemonLifecycleRequest,
+  buildDaemonShutdownRequest,
   resolveDaemonPaths,
   type DaemonRuntimeOwnership,
 } from '@agent-device/daemon-contracts/daemon-resolution';
+import { readDaemonShutdownReport } from '@agent-device/daemon-contracts/daemon-shutdown-report';
 import { readCurrentOwnerIdentity } from '@agent-device/host-kit/process';
 import type { DaemonResponse } from '@agent-device/kernel/contracts';
 import * as shutdown from './server-shutdown.ts';
@@ -129,6 +131,7 @@ type Booted = {
   stateDir: string;
   exit: Promise<number>;
   quiesce(overrides?: LifecycleAddress): Promise<DaemonResponse>;
+  shutdown(overrides?: LifecycleAddress): Promise<DaemonResponse>;
   sessionList(): Promise<DaemonResponse>;
 };
 
@@ -175,8 +178,11 @@ async function bootDaemon(
   };
   const socketPort = runtime.socketPort;
   const send = (request: object) => sendSocketRequest(socketPort, request);
-  const sendLifecycle = (overrides: LifecycleAddress) => {
-    const request = buildDaemonLifecycleRequest({
+  const sendLifecycle = (
+    overrides: LifecycleAddress,
+    build: typeof buildDaemonLifecycleRequest = buildDaemonLifecycleRequest,
+  ) => {
+    const request = build({
       token: overrides.token ?? runtime.token,
       fence: {
         pid: overrides.pid ?? info.pid,
@@ -193,7 +199,8 @@ async function bootDaemon(
     runtime,
     stateDir,
     exit,
-    quiesce: (overrides = {}) => sendLifecycle(overrides),
+    quiesce: (overrides = {}) => sendLifecycle(overrides, buildDaemonLifecycleRequest),
+    shutdown: (overrides = {}) => sendLifecycle(overrides, buildDaemonShutdownRequest),
     sessionList: () =>
       send({
         token: runtime.token,
@@ -231,7 +238,7 @@ test('an idle daemon accepts a quiesce, drains and releases its state directory'
   const published = JSON.parse(fs.readFileSync(paths.infoPath, 'utf8')) as {
     capabilities?: unknown;
   };
-  expect(published.capabilities).toEqual(['quiesce', 'script-artifacts']);
+  expect(published.capabilities).toEqual(['quiesce', 'script-artifacts', 'shutdown']);
 
   expect(await daemon.quiesce()).toEqual({ ok: true, data: { outcome: 'draining' } });
 
@@ -447,6 +454,7 @@ test('a quiesce with the wrong token or for another daemon instance leaves the d
 async function quiesceOverHttp(
   daemon: Booted,
   headers: Record<string, string>,
+  build: typeof buildDaemonLifecycleRequest = buildDaemonLifecycleRequest,
 ): Promise<{ result?: DaemonResponse; error?: { data?: { code?: string } } }> {
   const { httpPort, token } = daemon.runtime;
   const info = JSON.parse(
@@ -463,7 +471,7 @@ async function quiesceOverHttp(
       jsonrpc: '2.0',
       id: 'http-quiesce',
       method: 'agent_device.command',
-      params: buildDaemonLifecycleRequest({
+      params: build({
         token,
         fence: { pid: info.pid, processStartTime: info.processStartTime ?? null },
         requestId: 'http-quiesce',
@@ -648,5 +656,55 @@ test('a quiesce asked while the daemon is still starting up is refused as busy, 
   } finally {
     openGate();
     await starting.then((runtime) => runtime?.close());
+  }
+});
+
+test('shutdown accepts active sessions and leases, writes the shutdown report, and preserves quiesce security fences', async () => {
+  const embedded = await bootDaemon({ ownership: 'embedded' });
+  try {
+    expect(reasonOf(await embedded.shutdown())).toBe('daemon-owner-embedded');
+    expect((await embedded.sessionList()).ok).toBe(true);
+  } finally {
+    await embedded.runtime.close();
+  }
+
+  const remote = await bootDaemon({ serverMode: 'dual' });
+  try {
+    const body = await quiesceOverHttp(
+      remote,
+      { 'x-agent-device-network-access': 'public-only' },
+      buildDaemonShutdownRequest,
+    );
+    expect(JSON.stringify(body)).toContain('"UNAUTHORIZED"');
+    expect(reasonOf(await remote.shutdown({ processStartTime: 'other-start' }))).toBe(
+      'daemon-instance-mismatch',
+    );
+    expect((await remote.sessionList()).ok).toBe(true);
+  } finally {
+    await remote.runtime.close();
+  }
+
+  const daemon = await bootDaemon({ serverMode: 'dual' });
+  const paths = resolveDaemonPaths(daemon.stateDir);
+  try {
+    probe.store!.publish('open-session', makeSession('open-session'));
+    probe.registry!.allocateLease({
+      tenantId: 'tenant-a',
+      runId: 'run-a',
+      ttlMs: 60_000,
+    });
+    expect(reasonOf(await daemon.quiesce())).toBe('daemon-busy');
+
+    const response = await daemon.shutdown();
+    expect(response).toEqual({ ok: true, data: { outcome: 'draining' } });
+    expect(await daemon.exit).toBe(0);
+    expect(fs.existsSync(paths.infoPath)).toBe(false);
+    expect(fs.existsSync(paths.lockPath)).toBe(false);
+    expect(readDaemonShutdownReport(paths.baseDir)).toMatchObject({
+      providerReleases: { released: [], pending: [] },
+      claims: { released: [], orphaned: [], superseded: [], unattributable: [] },
+    });
+  } finally {
+    await daemon.runtime.close();
   }
 });

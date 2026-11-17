@@ -209,7 +209,7 @@
     "packages/proxy/src/daemon-proxy.ts#rewriteUploadDirectUrl": "sha256:b121db3ffb5a520b4b31810a2e28ff01c1a15d959514c9fbe2a61cd960d2af93",
     "packages/proxy/src/daemon-proxy.ts#rewriteUploadPreflightResponse": "sha256:332820b6f10e079632330c2c4996c4faa6f339e921f12f287bd83c9296df5ccd",
     "packages/proxy/src/daemon-proxy.ts#rewrittenUploadPreflightResponse": "sha256:21d633d947cd72f5008bcc886a8f3ecd4f778b594d0654b8d0741db8594003db",
-    "packages/daemon-contracts/src/daemon-resolution.ts#DAEMON_CAPABILITIES": "sha256:3478986d0e7b0e55e965c087a7b1dfd3cc018abdb372dba256cf90d27e63ed0b",
+    "packages/daemon-contracts/src/daemon-resolution.ts#DAEMON_CAPABILITIES": "sha256:0b3e651ac2983aaeb3c0186db12542c3154e409650f9828f1b812a6abc4185d1",
     "packages/daemon-contracts/src/daemon-resolution.ts#DaemonCapability": "sha256:2a5acf280a72e3d54c5ad7b52aece3ced37a30e4e721ef106a98e3bbd18ddbc3",
     "packages/daemon-contracts/src/daemon-resolution.ts#readDaemonCapabilities": "sha256:e410d36be74d307f7e5d8ddae63af5aae77f8eef77951ce9eeb7724f2fefae88",
     "packages/remote/src/daemon-artifacts.ts#downloadResponseArtifacts": "sha256:bc620e6f98821fdfe7e65eb63404eb175ffd583730cb877fa5a5f9f4e80c9fe0",
@@ -574,6 +574,11 @@
       "declaration": "packages/remote/src/artifact-download.ts#RemoteArtifactDownload",
       "digest": "sha256:e87a625bdff05fa55f6321ff09a35496f59edd228a1d7420268d54fcc2982868",
       "rationale": "#4511 adds the optional client-local privateFile field: the download creates a new 0600 file exclusively, never through a symbolic link, and stops once it crosses maxBytes. It is never sent, and every existing call site omits it, so the GET /artifacts/:id framing is unchanged."
+    },
+    {
+      "declaration": "packages/daemon-contracts/src/daemon-resolution.ts#DAEMON_CAPABILITIES",
+      "digest": "sha256:0b3e651ac2983aaeb3c0186db12542c3154e409650f9828f1b812a6abc4185d1",
+      "rationale": "Adds the 'shutdown' daemon capability to DAEMON_CAPABILITIES published in local daemon.json. Under ADR 0006, capabilities are additive metadata: daemons that predate 'shutdown' omit it and new stop callers treat its absence as 'cannot do this' (retiring via OS signals without sending daemon_shutdown), while older clients filter recognized entries through readDaemonCapabilities and ignore unknown capability strings."
     }
   ]
 }

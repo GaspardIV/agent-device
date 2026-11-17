@@ -125,6 +125,21 @@ export type DaemonTerminationResult =
       signal?: NodeJS.Signals;
     }>;
 
+export type DaemonGracefulShutdownOutcome = 'accepted' | 'unavailable' | 'embedded-owner';
+
+/**
+ * In-band graceful shutdown hook tried before OS process signals. Needed on platforms such as
+ * Windows where cross-process `SIGTERM` terminates immediately without invoking signal handlers.
+ */
+export type DaemonGracefulShutdown = (
+  identity: DaemonProcessIdentity,
+) => Promise<DaemonGracefulShutdownOutcome>;
+
+function canSignalGracefully(): boolean {
+  // Win32 TerminateProcess handles cross-process SIGTERM immediately without invoking Node handlers.
+  return process.platform !== 'win32';
+}
+
 /** Owns every signal and exit wait for one observed daemon lifetime. */
 export async function stopDaemonProcess(
   observed: Readonly<OwnerIdentity>,
@@ -132,6 +147,7 @@ export async function stopDaemonProcess(
     mode: 'graceful' | 'force';
     termTimeoutMs: number;
     killTimeoutMs: number;
+    gracefulShutdown?: DaemonGracefulShutdown;
   },
 ): Promise<DaemonTerminationResult> {
   if (!isProcessPid(observed.pid)) return { status: 'retained', reason: 'identity-unverified' };
@@ -143,34 +159,61 @@ export async function stopDaemonProcess(
   if ((await waitForDaemonExit(identity, { timeoutMs: 0 })).exited) {
     return { status: 'exited', identity, mode: 'already-exited' };
   }
-  let previousSignal: 'SIGTERM' | undefined;
+  let previousGraceful = false;
   if (options.mode === 'graceful') {
-    const result = await signalAndWaitForDaemonExit(identity, {
-      signal: 'SIGTERM',
-      timeoutMs: options.termTimeoutMs,
-    });
-    if (result.status !== 'survived') return result;
-    previousSignal = 'SIGTERM';
+    const graceful = await stopDaemonGracefully(identity, options);
+    if (graceful.status !== 'survived') return graceful;
+    previousGraceful = graceful.previousGraceful;
   }
   const result = await signalAndWaitForDaemonExit(identity, {
     signal: 'SIGKILL',
     timeoutMs: options.killTimeoutMs,
-    previousSignal,
+    previousGraceful,
   });
   return result.status === 'survived' ? { status: 'retained', reason: 'exit-timeout' } : result;
 }
 
+async function stopDaemonGracefully(
+  identity: DaemonProcessIdentity,
+  options: { termTimeoutMs: number; gracefulShutdown?: DaemonGracefulShutdown },
+): Promise<DaemonTerminationResult | Readonly<{ status: 'survived'; previousGraceful: boolean }>> {
+  if (options.gracefulShutdown) {
+    if (!isAgentDeviceDaemonProcess(identity.pid, identity.startTime)) {
+      return (await waitForDaemonExit(identity, { timeoutMs: 0 })).exited
+        ? { status: 'exited', identity, mode: 'already-exited' }
+        : { status: 'retained', reason: 'identity-unverified' };
+    }
+    const outcome = await options.gracefulShutdown(identity);
+    if (outcome === 'embedded-owner') return { status: 'retained', reason: 'embedded-owner' };
+    if (outcome === 'accepted') {
+      return (await waitForDaemonExit(identity, { timeoutMs: options.termTimeoutMs })).exited
+        ? { status: 'exited', identity, mode: 'graceful' }
+        : { status: 'survived', previousGraceful: true };
+    }
+    if ((await waitForDaemonExit(identity, { timeoutMs: 0 })).exited) {
+      return { status: 'exited', identity, mode: 'already-exited' };
+    }
+  }
+  const term = await signalAndWaitForDaemonExit(identity, {
+    signal: 'SIGTERM',
+    timeoutMs: options.termTimeoutMs,
+  });
+  return term.status === 'survived'
+    ? { status: 'survived', previousGraceful: canSignalGracefully() }
+    : term;
+}
+
 async function signalAndWaitForDaemonExit(
   identity: DaemonProcessIdentity,
-  options: { signal: 'SIGTERM' | 'SIGKILL'; timeoutMs: number; previousSignal?: 'SIGTERM' },
+  options: { signal: 'SIGTERM' | 'SIGKILL'; timeoutMs: number; previousGraceful?: boolean },
 ): Promise<DaemonTerminationResult | Readonly<{ status: 'survived' }>> {
   const verified = isAgentDeviceDaemonProcess(identity.pid, identity.startTime);
   const signaled = verified && trySignalProcess(identity.pid, options.signal);
   const mode = signaled
-    ? options.signal === 'SIGTERM'
+    ? options.signal === 'SIGTERM' && canSignalGracefully()
       ? 'graceful'
       : 'forced'
-    : options.previousSignal
+    : options.previousGraceful
       ? 'graceful'
       : 'already-exited';
   const wait = await waitForDaemonExit(identity, {

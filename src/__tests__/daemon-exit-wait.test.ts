@@ -254,7 +254,7 @@ test('force termination delivers KILL first and returns its confirmed exit', asy
   });
 });
 
-test('a daemon that becomes a zombie on TERM retains graceful mode without SIGKILL', async () => {
+test('a daemon that becomes a zombie on TERM retains graceful mode on POSIX and forced on win32', async () => {
   onSignal = (signal) => {
     if (signal !== 'SIGTERM') return;
     state.states.set(PID, 'Z');
@@ -265,5 +265,82 @@ test('a daemon that becomes a zombie on TERM retains graceful mode without SIGKI
     { mode: 'graceful', termTimeoutMs: 0, killTimeoutMs: 0 },
   );
   expect(signals).toEqual(['SIGTERM']);
-  expect(result).toMatchObject({ status: 'exited', mode: 'graceful' });
+  expect(result).toMatchObject({
+    status: 'exited',
+    mode: process.platform === 'win32' ? 'forced' : 'graceful',
+  });
+});
+
+test('stopDaemonProcess uses gracefulShutdown before signaling and escalates to SIGKILL on timeout', async () => {
+  const gracefulShutdown = vi.fn(async () => {
+    state.alive.set(PID, false);
+    return 'accepted' as const;
+  });
+  const accepted = await stopDaemonProcess(
+    { pid: PID, startTime: OURS },
+    { mode: 'graceful', termTimeoutMs: TIMEOUT_MS, killTimeoutMs: 40, gracefulShutdown },
+  );
+  expect(accepted).toEqual({
+    status: 'exited',
+    identity: { pid: PID, startTime: OURS },
+    mode: 'graceful',
+  });
+  expect(gracefulShutdown).toHaveBeenCalledWith({ pid: PID, startTime: OURS });
+  expect(signals).toEqual([]);
+
+  state.alive.set(PID, true);
+  onSignal = (signal) => {
+    if (signal === 'SIGKILL') state.alive.set(PID, false);
+  };
+  const timedOut = await stopDaemonProcess(
+    { pid: PID, startTime: OURS },
+    {
+      mode: 'graceful',
+      termTimeoutMs: 0,
+      killTimeoutMs: 40,
+      gracefulShutdown: async () => 'accepted',
+    },
+  );
+  expect(timedOut).toEqual({
+    status: 'exited',
+    identity: { pid: PID, startTime: OURS },
+    mode: 'forced',
+  });
+  expect(signals).toEqual(['SIGKILL']);
+});
+
+test('stopDaemonProcess treats Win32 SIGTERM fallback as forced instead of graceful', async () => {
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+  onSignal = (signal) => {
+    if (signal === 'SIGTERM') state.alive.set(PID, false);
+  };
+  const result = await stopDaemonProcess(
+    { pid: PID, startTime: OURS },
+    {
+      mode: 'graceful',
+      termTimeoutMs: TIMEOUT_MS,
+      killTimeoutMs: 40,
+      gracefulShutdown: async () => 'unavailable',
+    },
+  );
+  expect(result).toEqual({
+    status: 'exited',
+    identity: { pid: PID, startTime: OURS },
+    mode: 'forced',
+  });
+  expect(signals).toEqual(['SIGTERM']);
+});
+
+test('stopDaemonProcess retains embedded-owner without signaling when gracefulShutdown reports embedded ownership', async () => {
+  const result = await stopDaemonProcess(
+    { pid: PID, startTime: OURS },
+    {
+      mode: 'graceful',
+      termTimeoutMs: TIMEOUT_MS,
+      killTimeoutMs: 40,
+      gracefulShutdown: async () => 'embedded-owner',
+    },
+  );
+  expect(result).toEqual({ status: 'retained', reason: 'embedded-owner' });
+  expect(signals).toEqual([]);
 });

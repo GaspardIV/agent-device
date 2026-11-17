@@ -1,4 +1,5 @@
 import { AppError } from '@agent-device/kernel/errors';
+import type { DaemonGracefulShutdown } from './daemon-process.ts';
 import type { DaemonRetirementResult } from './daemon-registration-owner.ts';
 
 import {
@@ -56,6 +57,7 @@ export async function stopDaemon(params: {
   observed: ObservedDaemonIdentity | null;
   graceTimeoutMs?: number;
   killTimeoutMs?: number;
+  gracefulShutdown?: DaemonGracefulShutdown;
 }): Promise<DaemonStopResult> {
   const observed = params.observed;
   if (!observed) return daemonNotRunningStopResult();
@@ -66,6 +68,7 @@ export async function stopDaemon(params: {
     mode: 'graceful',
     termTimeoutMs: params.graceTimeoutMs ?? DAEMON_STOP_GRACE_TIMEOUT_MS,
     killTimeoutMs: params.killTimeoutMs ?? DAEMON_STOP_KILL_TIMEOUT_MS,
+    ...(params.gracefulShutdown ? { gracefulShutdown: params.gracefulShutdown } : {}),
   });
   if (retirement.status === 'retained' && retirement.termination?.status === 'not-running')
     return daemonNotRunningStopResult();

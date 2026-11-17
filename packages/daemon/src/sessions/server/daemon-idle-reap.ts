@@ -2,6 +2,7 @@ import {
   DAEMON_LIFECYCLE_REASONS,
   DAEMON_SHUTTING_DOWN_REASON,
   DAEMON_QUIESCE_COMMAND,
+  DAEMON_SHUTDOWN_COMMAND,
   readDaemonLifecycleFence,
   type DaemonLifecycleCensus,
   type DaemonLifecycleFence,
@@ -228,7 +229,7 @@ export function createDaemonLifecycleAdmission(params: {
     error: normalizeError(error),
   });
 
-  const leave = (req: DaemonRequest): DaemonResponse => {
+  const leave = (req: DaemonRequest, options: { requireIdle: boolean }): DaemonResponse => {
     // A remote client reaches this daemon through the proxy with the shared token, and only the
     // host that owns the state directory may retire the daemon on it.
     if (req.internal?.publicNetworkOnly) {
@@ -248,12 +249,17 @@ export function createDaemonLifecycleAdmission(params: {
     // Admission closes and the census is read in the same synchronous step, so no request can be
     // admitted between the two; a refusal reopens admission in that same step.
     if (!admitting) return { ok: true, data: { outcome: 'draining' } };
+    // Refuse before `runtime.close` exists so neither quiesce nor shutdown invokes an uninitialized drain path.
+    if (params.startingUp()) {
+      return refuse(busy(readCensus()));
+    }
     admitting = false;
-    const census = readCensus();
-    const held = isHeld(census);
-    if (held) {
-      admitting = true;
-      return refuse(busy(census));
+    if (options.requireIdle) {
+      const census = readCensus();
+      if (isHeld(census)) {
+        admitting = true;
+        return refuse(busy(census));
+      }
     }
     setImmediate(() => params.drain());
     return { ok: true, data: { outcome: 'draining' } };
@@ -279,7 +285,8 @@ export function createDaemonLifecycleAdmission(params: {
       if (typeof req.token !== 'string' || !timingSafeStringEqual(req.token, params.token)) {
         return refuse(new AppError('UNAUTHORIZED', 'Invalid daemon token.'));
       }
-      if (req.command === DAEMON_QUIESCE_COMMAND) return leave(req);
+      if (req.command === DAEMON_QUIESCE_COMMAND) return leave(req, { requireIdle: true });
+      if (req.command === DAEMON_SHUTDOWN_COMMAND) return leave(req, { requireIdle: false });
       return admitting ? await handler(req) : daemonShuttingDownResponse();
     },
   };

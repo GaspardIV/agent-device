@@ -148,7 +148,7 @@ export function resolveDaemonTransportPreference(
 }
 
 /** What a daemon can do beyond the base RPC contract, published in its `daemon.json`. */
-export const DAEMON_CAPABILITIES = ['quiesce', 'script-artifacts'] as const;
+export const DAEMON_CAPABILITIES = ['quiesce', 'script-artifacts', 'shutdown'] as const;
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 
 /**
@@ -201,6 +201,9 @@ export function readDaemonOwnership(value: unknown): DaemonOwnership {
 /** Stop if idle: refuses while the detached daemon holds work. */
 export const DAEMON_QUIESCE_COMMAND = 'daemon_quiesce';
 
+/** Shut down cleanly even while holding active work; sessions and leases are finalized. */
+export const DAEMON_SHUTDOWN_COMMAND = 'daemon_shutdown';
+
 /** The reason a daemon gives every request it refuses once it has begun to leave. */
 export const DAEMON_SHUTTING_DOWN_REASON = 'daemon_shutting_down';
 
@@ -251,11 +254,34 @@ export function buildDaemonLifecycleRequest(params: {
   fence: DaemonLifecycleFence;
   requestId: string;
 }): DaemonWireRequest {
+  return buildDaemonControlRequest(DAEMON_QUIESCE_COMMAND, params);
+}
+
+/**
+ * Fenced shutdown request for an explicit daemon stop, so a daemon whose OS signals terminate
+ * abruptly (such as Win32 `SIGTERM`) can flush its shutdown report and release active leases.
+ */
+export function buildDaemonShutdownRequest(params: {
+  token: string;
+  fence: DaemonLifecycleFence;
+  requestId: string;
+}): DaemonWireRequest {
+  return buildDaemonControlRequest(DAEMON_SHUTDOWN_COMMAND, params);
+}
+
+function buildDaemonControlRequest(
+  command: typeof DAEMON_QUIESCE_COMMAND | typeof DAEMON_SHUTDOWN_COMMAND,
+  params: {
+    token: string;
+    fence: DaemonLifecycleFence;
+    requestId: string;
+  },
+): DaemonWireRequest {
   const { token, fence, requestId } = params;
   return {
     token,
     session: 'default',
-    command: DAEMON_QUIESCE_COMMAND,
+    command,
     positionals: [],
     input: { pid: fence.pid, processStartTime: fence.processStartTime },
     meta: { requestId },

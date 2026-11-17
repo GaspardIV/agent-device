@@ -6,7 +6,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { DAEMON_RPC_PROTOCOL_VERSION } from '@agent-device/contracts/daemon-http';
 import { skipWhenLoopbackUnavailable } from '@agent-device/test-kit';
-import { stopDaemonProcess } from '@agent-device/daemon-contracts/daemon-process';
 import { formatResultDebug } from './cli-json.ts';
 import { assertNoDaemonLeaks } from './support/daemon-leak-oracle.ts';
 import { runCliJson } from './test-helpers.ts';
@@ -72,7 +71,7 @@ test('daemon HTTP transport starts from CLI and accepts a command RPC', async (t
     // unclassified state-dir residue. Asserted on the success path so the
     // oracle's settle window can never replace a primary assertion's
     // diagnostic; the `finally` below stays best-effort cleanup.
-    await stopDaemon(info);
+    await stopDaemon(stateDir, info);
     await assertNoDaemonLeaks({ stateDir, daemonPids: [info.pid], phase: 'after-shutdown' });
   } finally {
     await cleanupDaemonTestState(stateDir, info);
@@ -110,11 +109,17 @@ async function callCommandRpc(
   };
 }
 
-async function stopDaemon(info: DaemonInfo): Promise<void> {
+async function stopDaemon(stateDir: string, info: DaemonInfo): Promise<void> {
   if (!Number.isInteger(info.pid) || info.pid <= 0) return;
-  const termination = await stopDaemonProcess(
-    { pid: info.pid, startTime: info.processStartTime ?? null },
-    { mode: 'graceful', termTimeoutMs: 1500, killTimeoutMs: 1500 },
+  const stopped = runCliJson(['daemon', 'stop', '--json', '--state-dir', stateDir]);
+  assert.equal(
+    stopped.status,
+    0,
+    formatResultDebug('stop HTTP daemon', ['daemon', 'stop'], stopped),
   );
-  assert.notEqual(termination.status, 'retained', JSON.stringify(termination));
+  assert.equal(stopped.json?.success, true, JSON.stringify(stopped.json));
+  assert.equal(stopped.json?.data?.stopped, true, JSON.stringify(stopped.json));
+  assert.equal(stopped.json?.data?.mode, 'graceful', JSON.stringify(stopped.json));
+  assert.equal(stopped.json?.data?.cleanupConfidence, 'known', JSON.stringify(stopped.json));
+  assert.deepEqual(stopped.json?.data?.warnings, [], JSON.stringify(stopped.json));
 }

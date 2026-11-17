@@ -192,3 +192,21 @@ test.each(['registration-replaced', 'retirement-unconfirmed'])(
     expect(fs.existsSync(paths.infoPath)).toBe(true);
   },
 );
+
+test('stopDaemon forwards gracefulShutdown only when provided', async () => {
+  const paths = createDaemonPaths();
+  const gracefulShutdown = vi.fn(async () => 'accepted' as const);
+  mocks.stopAndRetireDaemon.mockResolvedValue(retired('graceful'));
+  await expect(stopDaemon({ paths, observed, gracefulShutdown })).resolves.toMatchObject({
+    stopped: true,
+    mode: 'graceful',
+  });
+  expect(mocks.stopAndRetireDaemon).toHaveBeenCalledWith({
+    paths,
+    observed,
+    mode: 'graceful',
+    termTimeoutMs: 10_000,
+    killTimeoutMs: 2_000,
+    gracefulShutdown,
+  });
+});

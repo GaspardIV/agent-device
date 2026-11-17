@@ -8,10 +8,12 @@ import {
   type OwnerIdentity,
 } from '@agent-device/host-kit/process';
 import {
+  readDaemonCapabilities,
   readDaemonOwnership,
   readDaemonRecord,
   readRecordedDaemonTransport,
   resolveDaemonPaths,
+  type DaemonCapability,
   type DaemonOwnership,
   type DaemonPaths,
   type DaemonServerMode,
@@ -205,11 +207,44 @@ function readableStartTime(value: unknown): string | null {
  * present and cannot be read or parsed: it may describe a runtime that is serving, so a stop refuses it
  * rather than reporting that nothing runs.
  */
+/** Endpoint details captured alongside the daemon stop identity for in-band graceful shutdown. */
+export type DaemonStopEndpoint = Readonly<{
+  port?: number;
+  httpPort?: number;
+  transport?: DaemonServerMode;
+  token: string;
+  capabilities?: readonly DaemonCapability[];
+}>;
+
 export type DaemonStopIdentity = Readonly<{
   /** `absent`: no record. `unreadable`: a record whose contents cannot be used, unreadable or malformed. */
   ownership: DaemonOwnership | 'absent' | 'unreadable';
   identity: OwnerIdentity | null;
+  endpoint?: DaemonStopEndpoint;
 }>;
+
+function readStopPort(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 65_535
+    ? value
+    : undefined;
+}
+
+function readStopEndpoint(record: DaemonRecord): DaemonStopEndpoint | undefined {
+  const token = typeof record.token === 'string' && record.token.length > 0 ? record.token : null;
+  if (!token) return undefined;
+  const port = readStopPort(record.port);
+  const httpPort = readStopPort(record.httpPort);
+  if (port === undefined && httpPort === undefined) return undefined;
+  const transport = readRecordedDaemonTransport(record.transport);
+  const capabilities = readDaemonCapabilities(record.capabilities);
+  return {
+    ...(port !== undefined ? { port } : {}),
+    ...(httpPort !== undefined ? { httpPort } : {}),
+    ...(transport !== undefined ? { transport } : {}),
+    token,
+    ...(capabilities.length > 0 ? { capabilities } : {}),
+  };
+}
 
 /**
  * Reads a state directory's record once for a stop: whether it names a process, and whose process that
@@ -223,7 +258,15 @@ export function readDaemonStopIdentity(infoPath: string): DaemonStopIdentity {
       ownership: reading.status === 'absent' ? 'absent' : 'unreadable',
       identity: null,
     };
-  return { ownership: reading.ownership, identity: reading.identity };
+  const endpoint =
+    reading.ownership === 'detached' && reading.identity
+      ? readStopEndpoint(reading.record)
+      : undefined;
+  return {
+    ownership: reading.ownership,
+    identity: reading.identity,
+    ...(endpoint ? { endpoint } : {}),
+  };
 }
 
 /**
