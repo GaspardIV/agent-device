@@ -3,6 +3,7 @@ import { validationTestReporter } from './scripts/check-affected/test-report.ts'
 import { resolveVitestMaxWorkers } from './scripts/lib/vitest-concurrency.ts';
 import coverageRunStampReporter from './scripts/vitest-coverage-run-stamp-reporter.ts';
 import slowTestGateReporter from './scripts/vitest-slow-test-reporter.ts';
+import ciTimingReporter from './scripts/vitest-ci-timing-reporter.ts';
 
 const validationReport = process.env.AGENT_DEVICE_VALIDATION_REPORT;
 delete process.env.AGENT_DEVICE_VALIDATION_REPORT;
@@ -120,6 +121,8 @@ export default defineConfig({
       ),
       slowTestGateReporter(),
       coverageRunStampReporter(COVERAGE_UNINSTRUMENTED_PROJECTS),
+      // TEMPORARY CI PROBE: no-ops unless AGENT_DEVICE_CI_TIMING_FILE is set.
+      ciTimingReporter(),
       // Vitest adds this only when no reporters are configured; it puts failing tests on the check.
       ...(process.env.GITHUB_ACTIONS === 'true'
         ? [['github-actions', { jobSummary: { enabled: false } }] satisfies [string, object]]

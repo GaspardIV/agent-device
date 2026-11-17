@@ -1,0 +1,77 @@
+name: Coverage Probe
+
+# TEMPORARY. Manual-only measurement lane for the Coverage job's wall time: runner class, worker
+# count, and the cost of the coverage instrumentation itself. Delete once the Coverage job's shape
+# is settled from its numbers.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Probe ${{ matrix.id }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Baseline: what the Coverage job runs today, measured with the probe reporter.
+          - id: x64-8-default
+            runs-on: blacksmith-8vcpu-ubuntu-2404
+            leg: coverage
+          # Is the 8 vCPU lane the limit, or is something else serializing?
+          - id: x64-8-w16
+            runs-on: blacksmith-8vcpu-ubuntu-2404
+            leg: coverage
+            workers: '16'
+          # Twice the cores.
+          - id: x64-16-default
+            runs-on: blacksmith-16vcpu-ubuntu-2404
+            leg: coverage
+          # ARM at the same size and at twice the size: cheaper per minute than x64.
+          - id: arm-8-default
+            runs-on: blacksmith-8vcpu-ubuntu-2404-arm
+            leg: coverage
+          - id: arm-16-default
+            runs-on: blacksmith-16vcpu-ubuntu-2404-arm
+            leg: coverage
+          # Same runner and workers as the baseline, without instrumentation: the coverage cost
+          # itself, read as the difference.
+          - id: x64-8-nocov
+            runs-on: blacksmith-8vcpu-ubuntu-2404
+            leg: unit
+    env:
+      AGENT_DEVICE_CI_TIMING_FILE: .tmp/ci-timing-${{ matrix.id }}.json
+      AGENT_DEVICE_REQUIRE_LOOPBACK_TESTS: '1'
+      VITEST_MAX_WORKERS: ${{ matrix.workers }}
+    steps:
+      - name: Checkout
+        uses: useblacksmith/checkout@2b9fe87d796feea153b455ec2f3125b471a7b0e7 # v1.8.2
+
+      - name: Setup toolchain
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Run coverage
+        if: matrix.leg == 'coverage'
+        uses: ./.github/actions/run-gate
+        with: { gate: unit-ci }
+
+      - name: Run unit suite without instrumentation
+        if: matrix.leg == 'unit'
+        run: pnpm exec vitest run --allowOnly=false --project=!fuzz-worker
+
+      - name: Upload timing
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-timing-${{ matrix.id }}
+          path: .tmp/ci-timing-*.json
+          if-no-files-found: warn
