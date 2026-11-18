@@ -89,7 +89,11 @@ export async function requestDaemonLifecycle(
   options?: { timeoutMs?: number },
 ): Promise<DaemonLifecycleOutcome> {
   const timeoutMs = options?.timeoutMs ?? LIFECYCLE_REQUEST_TIMEOUT_MS;
-  if (typeof info.controlPort === 'number') {
+  if (
+    typeof info.controlPort === 'number' &&
+    typeof info.controlSecret === 'string' &&
+    info.controlSecret.length > 0
+  ) {
     const result = await sendAuthenticatedControlCommand(info, DAEMON_QUIESCE_COMMAND, timeoutMs);
     return handleAuthenticatedQuiesceResult(result, info, target);
   }
@@ -155,22 +159,23 @@ function handleAuthenticatedQuiesceResult(
 /**
  * Asks a fenced detached daemon to shut down gracefully over the authenticated local control
  * channel without waiting for idle-only admission. Returns `undefined` when `info` predates
- * `shutdown`, has a non-detached owner, or lacks a local control port/token.
+ * `shutdown`, has a non-detached owner, or lacks a local control port/secret.
  */
 export function createGracefulDaemonShutdown(
   info: DaemonInfo | null | undefined,
-  target: DaemonLifecycleTarget,
+  target: Readonly<{ paths: DaemonPaths; host?: HostEnvironment }>,
   options?: { timeoutMs?: number },
 ): DaemonGracefulShutdown | undefined {
   if (!info || (info.ownership && info.ownership !== 'detached')) return undefined;
   if (!info.capabilities?.includes('shutdown')) return undefined;
-  if (!info.token || typeof info.controlPort !== 'number') return undefined;
+  if (!info.controlSecret || typeof info.controlPort !== 'number') return undefined;
+  const lifecycleTarget: Readonly<{ paths: DaemonPaths }> = { paths: target.paths };
   const timeoutMs = options?.timeoutMs ?? SHUTDOWN_REQUEST_TIMEOUT_MS;
   return async (identity) => {
     const fencedInfo = fenceDaemonInfo(info, identity);
     const deadline = Date.now() + SHUTDOWN_STARTUP_RETRY_BUDGET_MS;
     for (;;) {
-      const outcome = await requestDaemonShutdownAttempt(fencedInfo, target, timeoutMs);
+      const outcome = await requestDaemonShutdownAttempt(fencedInfo, lifecycleTarget, timeoutMs);
       if (outcome !== 'retry-startup') return outcome;
       const remaining = deadline - Date.now();
       if (remaining <= 0) return 'unavailable';
@@ -188,7 +193,7 @@ function fenceDaemonInfo(info: DaemonInfo, identity: DaemonProcessIdentity): Dae
 
 async function requestDaemonShutdownAttempt(
   fencedInfo: DaemonInfo,
-  target: DaemonLifecycleTarget,
+  target: Readonly<{ paths: DaemonPaths }>,
   timeoutMs: number,
 ): Promise<ShutdownAttemptOutcome> {
   const result = await sendAuthenticatedControlCommand(
@@ -214,7 +219,7 @@ async function requestDaemonShutdownAttempt(
 
 function judgeGoneShutdown(
   fencedInfo: DaemonInfo,
-  target: DaemonLifecycleTarget,
+  target: Readonly<{ paths: DaemonPaths }>,
 ): ShutdownAttemptOutcome {
   const ownership = readRegisteredDaemonOwnership(target.paths.infoPath, {
     pid: fencedInfo.pid,
@@ -236,6 +241,8 @@ async function sendAuthenticatedControlCommand(
 ): Promise<AuthenticatedControlResult> {
   const controlPort = info.controlPort;
   if (typeof controlPort !== 'number') return { kind: 'gone' };
+  const controlSecret = info.controlSecret;
+  if (!controlSecret) return { kind: 'unauthenticated' };
   const fence: DaemonLifecycleFence = {
     pid: info.pid,
     processStartTime: info.processStartTime ?? null,
@@ -288,7 +295,7 @@ async function sendAuthenticatedControlCommand(
         if (
           !challenge ||
           !verifyDaemonControlChallenge({
-            token: info.token,
+            token: controlSecret,
             fence,
             clientNonce,
             serverNonce: challenge.serverNonce,
@@ -313,7 +320,7 @@ async function sendAuthenticatedControlCommand(
           processStartTime: fence.processStartTime,
           requestId,
           proof: signDaemonControlCommand({
-            token: info.token,
+            token: controlSecret,
             command,
             fence,
             clientNonce,
@@ -329,7 +336,7 @@ async function sendAuthenticatedControlCommand(
       if (
         !reply ||
         !verifyDaemonControlReply({
-          token: info.token,
+          token: controlSecret,
           fence,
           clientNonce,
           serverNonce,

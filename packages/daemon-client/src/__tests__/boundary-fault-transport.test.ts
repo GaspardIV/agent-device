@@ -1,5 +1,6 @@
 import type { DaemonWireRequest } from '@agent-device/contracts/command';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
@@ -341,6 +342,75 @@ test('HTTP deadline stays armed through async remote error localization until se
     },
   );
   assert.ok(Date.now() - startedAt < 1_000, 'deadline must reject stalled remote localization');
+});
+
+test('HTTP slow remote artifact download settles past the RPC deadline once the response body arrived', async () => {
+  const endpoint = await startHttpServer((req, response) => {
+    if (req.method === 'GET' && req.url === '/health') {
+      response.setHeader('content-type', 'application/json');
+      response.end(
+        JSON.stringify({ ok: true, service: 'agent-device-daemon', rpcProtocolVersion: 2 }),
+      );
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/rpc') {
+      response.setHeader('content-type', 'application/json');
+      response.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'boundary-slow-artifact',
+          result: {
+            ok: true,
+            data: {
+              path: '/remote/boundary-fault.png',
+              artifacts: [
+                {
+                  field: 'path',
+                  artifactId: 'artifact-slow',
+                  fileName: 'boundary-fault.png',
+                  artifactType: 'screenshot',
+                },
+              ],
+            },
+          },
+        }),
+      );
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/artifacts/artifact-slow') {
+      setTimeout(() => {
+        response.setHeader('content-type', 'application/octet-stream');
+        response.end(Buffer.from('png-bytes'));
+      }, 220);
+      return;
+    }
+    response.statusCode = 404;
+    response.end();
+  });
+
+  const paths = daemonPaths();
+  const outputPath = path.join(paths.baseDir, 'downloaded-screenshot.png');
+  const request: DaemonWireRequest = {
+    ...buildRequest(COMMAND_ROWS['artifact-producing'], 'slow-artifact'),
+    positionals: [outputPath],
+    meta: {
+      requestId: 'boundary-slow-artifact',
+      clientArtifactPaths: { path: outputPath },
+    },
+  };
+
+  const result = await sendRequest(
+    { baseUrl: `http://127.0.0.1:${endpoint.port}`, token: 'test-token', pid: process.pid },
+    request,
+    'http',
+    paths,
+    80,
+    { host: createTestHostEnvironment() },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data?.path, outputPath);
+  assert.equal(fs.readFileSync(outputPath, 'utf8'), 'png-bytes');
 });
 
 function buildRequest(

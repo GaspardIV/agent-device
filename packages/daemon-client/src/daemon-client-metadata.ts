@@ -19,6 +19,7 @@ export type DaemonInfo = {
   port?: number;
   httpPort?: number;
   controlPort?: number;
+  controlSecret?: string;
   transport?: DaemonServerMode;
   token: string;
   pid: number;
@@ -153,10 +154,12 @@ function readDaemonInfoFromRecord(
   pid: number,
 ): DaemonInfo {
   const controlPort = readDaemonPort(parsed.controlPort);
+  const controlSecret = readOptionalNonEmptyString(parsed.controlSecret);
   return {
     token,
     ...ports,
     ...(controlPort !== undefined ? { controlPort } : {}),
+    ...(controlSecret !== undefined ? { controlSecret } : {}),
     transport: readRecordedDaemonTransport(parsed.transport),
     pid,
     version: readOptionalString(parsed.version),
@@ -189,6 +192,10 @@ function readDaemonInfoCodeOrigin(value: unknown): DaemonInfo['codeOrigin'] {
 
 function readOptionalString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+function readOptionalNonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 function readDaemonPort(value: unknown): number | undefined {

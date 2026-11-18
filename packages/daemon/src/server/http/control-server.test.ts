@@ -27,9 +27,10 @@ const IDENTITY = { pid: process.pid, processStartTime: 'Mon Nov 17 12:00:00 2026
 
 async function startControlServer(
   handleControl: Parameters<typeof createDaemonControlServer>[0]['handleControl'],
+  secret: string = TOKEN,
 ): Promise<number> {
   const server = createDaemonControlServer({
-    token: TOKEN,
+    secret,
     identity: IDENTITY,
     handleControl,
   });
@@ -206,5 +207,30 @@ test('control server drops unauthenticated, wrong-proof, replay, and oversized f
   });
 
   assert.equal(wrongProofResult, 'closed');
+  assert.equal(handleControl.mock.calls.length, 0);
+});
+
+test('control server fails closed when configured with an empty secret', async () => {
+  const handleControl = vi.fn(() => ({ ok: true as const, data: { outcome: 'draining' } }));
+  const port = await startControlServer(handleControl, '');
+
+  const closed = await new Promise<boolean>((resolve, reject) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    socket.on('error', reject);
+    socket.on('connect', () => {
+      socket.write(
+        `${JSON.stringify({
+          type: 'challenge',
+          version: DAEMON_CONTROL_PROTOCOL_VERSION,
+          nonce: createDaemonControlNonce(),
+          requestId: 'empty-secret',
+        })}\n`,
+      );
+    });
+    socket.on('data', () => reject(new Error('unexpected challenge response')));
+    socket.on('close', () => resolve(true));
+  });
+
+  assert.equal(closed, true);
   assert.equal(handleControl.mock.calls.length, 0);
 });

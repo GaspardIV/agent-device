@@ -21,7 +21,7 @@ import { createTrackedNetServer, type DaemonServer } from './transport.ts';
 const CONTROL_SOCKET_IDLE_TIMEOUT_MS = 10_000;
 
 export type DaemonControlServerOptions = Readonly<{
-  token: string;
+  secret: string;
   identity: DaemonLifecycleFence;
   handleControl: (command: DaemonControlCommand, fence: DaemonLifecycleFence) => DaemonResponse;
 }>;
@@ -109,11 +109,12 @@ function issueChallengeResponse(
   line: string,
   options: DaemonControlServerOptions,
 ): { pending: PendingChallenge; replyLine: string } | null {
+  if (!options.secret) return null;
   const challenge = parseControlChallengeRequest(line);
   if (!challenge) return null;
   const serverNonce = createDaemonControlNonce();
   const proof = signDaemonControlChallenge({
-    token: options.token,
+    token: options.secret,
     fence: options.identity,
     clientNonce: challenge.nonce,
     serverNonce,
@@ -139,6 +140,7 @@ function executeCommandLine(
   pending: PendingChallenge,
   options: DaemonControlServerOptions,
 ): string | null {
+  if (!options.secret) return null;
   const parsed = parseControlCommandRequest(line);
   if (
     !parsed ||
@@ -154,7 +156,7 @@ function executeCommandLine(
   };
   if (
     !verifyDaemonControlCommand({
-      token: options.token,
+      token: options.secret,
       command: parsed.command,
       fence,
       clientNonce: pending.clientNonce,
@@ -173,7 +175,7 @@ function executeCommandLine(
   }
   const payload = JSON.stringify(response);
   const proof = signDaemonControlReply({
-    token: options.token,
+    token: options.secret,
     fence,
     clientNonce: pending.clientNonce,
     serverNonce: pending.serverNonce,

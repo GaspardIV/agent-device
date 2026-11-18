@@ -1,9 +1,7 @@
-import {
-  DAEMON_QUIESCE_COMMAND,
-  type DaemonControlCommand,
-} from '@agent-device/daemon-contracts/daemon-control';
+import type { DaemonControlCommand } from '@agent-device/daemon-contracts/daemon-control';
 import {
   DAEMON_LIFECYCLE_REASONS,
+  DAEMON_QUIESCE_COMMAND,
   DAEMON_SHUTTING_DOWN_REASON,
   DAEMON_SHUTDOWN_COMMAND,
   readDaemonLifecycleFence,
@@ -265,18 +263,15 @@ export function createDaemonLifecycleAdmission(params: {
     return { ok: true, data: { outcome: 'draining' } };
   };
 
-  const leave = (req: DaemonRequest, options: { requireIdle: boolean }): DaemonResponse => {
+  const leave = (req: DaemonRequest): DaemonResponse => {
     // A remote client reaches this daemon through the proxy with the shared token, and only the
     // host that owns the state directory may retire the daemon on it.
     if (req.internal?.publicNetworkOnly) {
       return refuse(
-        new AppError(
-          'UNAUTHORIZED',
-          `Daemon ${options.requireIdle ? 'quiesce' : 'shutdown'} is not available to remote clients.`,
-        ),
+        new AppError('UNAUTHORIZED', 'Daemon quiesce is not available to remote clients.'),
       );
     }
-    return admitLeave(readDaemonLifecycleFence(req.input), options);
+    return admitLeave(readDaemonLifecycleFence(req.input), { requireIdle: true });
   };
 
   const readCensus = (): DaemonLifecycleCensus => {
@@ -301,7 +296,7 @@ export function createDaemonLifecycleAdmission(params: {
       if (typeof req.token !== 'string' || !timingSafeStringEqual(req.token, params.token)) {
         return refuse(new AppError('UNAUTHORIZED', 'Invalid daemon token.'));
       }
-      if (req.command === DAEMON_QUIESCE_COMMAND) return leave(req, { requireIdle: true });
+      if (req.command === DAEMON_QUIESCE_COMMAND) return leave(req);
       if (req.command === DAEMON_SHUTDOWN_COMMAND) {
         return refuse(
           new AppError(

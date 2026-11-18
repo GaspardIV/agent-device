@@ -6,6 +6,7 @@ import {
   createRecoveryPlatformScope,
 } from '@agent-device/daemon-contracts/device-claim-recovery';
 import crypto from 'node:crypto';
+import type { DaemonControlCommand } from '@agent-device/daemon-contracts/daemon-control';
 import { asAppError, AppError, normalizeError } from '@agent-device/kernel/errors';
 import { SessionStore } from '../../core/session-store.ts';
 import {
@@ -135,6 +136,7 @@ export type DaemonRuntimeController = {
   httpPort?: number;
   socketPort?: number;
   controlPort?: number;
+  controlSecret?: string;
   /**
    * Closes the runtime. Concurrent and repeated calls share one close, whose report every caller
    * receives. The runtime never exits the process: the executable owns signals and exit codes.
@@ -239,6 +241,7 @@ async function startDaemonRuntimeOnHost(
   const screenRecordingAdmissionLedger = createScreenRecordingAdmissionLedger();
   const version = readVersion();
   const token = crypto.randomBytes(24).toString('hex');
+  const controlSecret = crypto.randomBytes(24).toString('hex');
   const daemonIdentity = readCurrentOwnerIdentity();
   const { codeIdentity } = options;
   const requestDrainTimeoutMs =
@@ -529,6 +532,7 @@ async function startDaemonRuntimeOnHost(
       socketPort,
       httpPort,
       controlPort,
+      controlSecret,
       token,
       version,
       codeOrigin: codeIdentity.origin,
@@ -635,6 +639,7 @@ async function startDaemonRuntimeOnHost(
   recordStartupPhase('recovery-finished');
   const { openDaemonServers, reconcileDeviceClaimsForDaemonStartup } =
     await import('./server-startup.ts');
+  let acceptedControlCommand: DaemonControlCommand | undefined;
   const { servers, controlServer, socketPort, httpPort, controlPort } = await openDaemonServers(
     daemonServerMode,
     {
@@ -672,9 +677,13 @@ async function startDaemonRuntimeOnHost(
     },
     rollback,
     {
-      token,
+      secret: controlSecret,
       identity: { pid: daemonIdentity.pid, processStartTime: daemonIdentity.startTime },
-      handleControl: lifecycleAdmission.control,
+      handleControl: (command, fence) => {
+        const response = lifecycleAdmission.control(command, fence);
+        if (response.ok) acceptedControlCommand ??= command;
+        return response;
+      },
     },
   );
   recordStartupPhase('listening');
@@ -758,6 +767,11 @@ async function startDaemonRuntimeOnHost(
     // Cancellation and the listener close run together: a connection held by a request that ignores
     // cancellation is force-closed at the same budget the drain gives it.
     const serversClosed = closeDaemonServers(servers, requestDrainTimeoutMs);
+    if (acceptedControlCommand) {
+      await emitDaemonDiagnostic(logPath, 'daemon_control_shutdown_accepted', {
+        command: acceptedControlCommand,
+      }).catch(() => {});
+    }
     if (closeOptions.cause) await emitFatalDiagnostic(closeOptions.cause);
     const requests = await drainInFlightRequests();
     await serversClosed;
@@ -930,6 +944,7 @@ async function startDaemonRuntimeOnHost(
   return {
     httpPort,
     controlPort,
+    controlSecret,
     close,
     closed,
     run: runtimeState.run,

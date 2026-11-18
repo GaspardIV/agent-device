@@ -187,6 +187,25 @@ test('createGracefulDaemonShutdown never leaks token or trusts spoofed/silent/ab
   const controlPort = (server.address() as { port: number }).port;
   const paths = resolveDaemonPaths(mkdtempForTestSync('agent-device-rogue-ctrl-'));
   try {
+    const controlSecret = 'super-secret-control';
+    // Missing controlSecret must refuse even when the HTTP bearer token is present.
+    expect(
+      createGracefulDaemonShutdown(
+        {
+          pid: process.pid,
+          processStartTime: 'Mon Nov 17 12:00:00 2026',
+          ownership: 'detached',
+          port: controlPort,
+          controlPort,
+          transport: 'socket',
+          token: 'super-secret-token',
+          capabilities: DAEMON_CAPABILITIES,
+        },
+        { paths, host: createTestHostEnvironment() },
+        { timeoutMs: 80 },
+      ),
+    ).toBeUndefined();
+
     const graceful = createGracefulDaemonShutdown(
       {
         pid: process.pid,
@@ -194,6 +213,7 @@ test('createGracefulDaemonShutdown never leaks token or trusts spoofed/silent/ab
         ownership: 'detached',
         port: controlPort,
         controlPort,
+        controlSecret,
         transport: 'socket',
         token: 'super-secret-token',
         capabilities: DAEMON_CAPABILITIES,
@@ -210,6 +230,7 @@ test('createGracefulDaemonShutdown never leaks token or trusts spoofed/silent/ab
     const wire = received.join('');
     expect(wire).toContain('"type":"challenge"');
     expect(wire).not.toContain('super-secret-token');
+    expect(wire).not.toContain(controlSecret);
     expect(wire).not.toContain(DAEMON_SHUTDOWN_COMMAND);
     expect(wire).not.toContain('"type":"command"');
 
@@ -231,7 +252,7 @@ test('createGracefulDaemonShutdown never leaks token or trusts spoofed/silent/ab
 });
 
 test('requestDaemonLifecycle routes quiesce over controlPort, enforces auth, and rejects timeouts', async () => {
-  const token = 'quiesce-control-token';
+  const controlSecret = 'quiesce-control-secret';
   const fence = { pid: process.pid, processStartTime: 'Mon Nov 17 12:00:00 2026' } as const;
   const seenCommands: string[] = [];
   let mode: QuiesceMode = 'draining';
@@ -242,7 +263,7 @@ test('requestDaemonLifecycle routes quiesce over controlPort, enforces auth, and
     socket.on('close', () => openSockets.delete(socket));
     attachMockControlSession({
       socket,
-      token,
+      token: controlSecret,
       fence,
       getMode: () => mode,
       seenCommands,
@@ -257,8 +278,9 @@ test('requestDaemonLifecycle routes quiesce over controlPort, enforces auth, and
     pid: fence.pid,
     processStartTime: fence.processStartTime,
     controlPort,
+    controlSecret,
     port: controlPort,
-    token,
+    token: 'http-bearer-token',
     transport: 'socket' as const,
   };
 

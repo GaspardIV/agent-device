@@ -152,6 +152,7 @@ type LifecycleAddress = {
   pid?: number;
   processStartTime?: string | null;
   requestId?: string;
+  skipChallengeVerify?: boolean;
   /** Sends the request with no `meta` at all, the shape a caller that tracks no id produces. */
   omitMeta?: boolean;
 };
@@ -233,10 +234,11 @@ async function bootDaemon(
     quiesce: (overrides = {}) => sendLifecycle(overrides, buildDaemonLifecycleRequest),
     shutdown: (overrides = {}) =>
       sendControlCommand(controlPort, {
-        token: overrides.token ?? runtime.token,
+        token: overrides.token ?? runtime.controlSecret!,
         fence: resolveFence(overrides),
         command: DAEMON_SHUTDOWN_COMMAND,
         requestId: overrides.requestId ?? 'shutdown-test',
+        skipChallengeVerify: overrides.skipChallengeVerify,
       }),
     shutdownOverSocket: (overrides = {}) => sendLifecycle(overrides, buildShutdownProbeRequest),
     sessionList: () =>
@@ -257,6 +259,7 @@ async function sendControlCommand(
     fence: { pid: number; processStartTime: string | null };
     command: typeof DAEMON_SHUTDOWN_COMMAND;
     requestId: string;
+    skipChallengeVerify?: boolean;
   },
 ): Promise<DaemonResponse> {
   const clientNonce = createDaemonControlNonce();
@@ -299,13 +302,14 @@ async function sendControlCommand(
           const challenge = parseControlChallengeResponse(line);
           if (
             !challenge ||
-            !verifyDaemonControlChallenge({
-              token: options.token,
-              fence: options.fence,
-              clientNonce,
-              serverNonce: challenge.serverNonce,
-              proof: challenge.proof,
-            })
+            (!options.skipChallengeVerify &&
+              !verifyDaemonControlChallenge({
+                token: options.token,
+                fence: options.fence,
+                clientNonce,
+                serverNonce: challenge.serverNonce,
+                proof: challenge.proof,
+              }))
           ) {
             finish(() =>
               resolve({
@@ -662,10 +666,29 @@ test('an HTTP-only daemon with AGENT_DEVICE_HTTP_AUTH_HOOK refuses /rpc shutdown
       port?: number;
       httpPort?: number;
       controlPort?: number;
+      controlSecret?: string;
+      token?: string;
     };
     expect(published.port).toBeUndefined();
     expect(published.httpPort).toBe(daemon.runtime.httpPort);
     expect(published.controlPort).toBe(daemon.runtime.controlPort);
+    expect(published.controlSecret).toBe(daemon.runtime.controlSecret);
+    expect(published.controlSecret).toBeTruthy();
+    expect(published.controlSecret).not.toBe(published.token);
+
+    // A tenant carrying the HTTP bearer token must NOT be able to shut down the daemon via controlPort
+    // (rejected on both client challenge verification and server command HMAC verification).
+    await expect(daemon.shutdown({ token: daemon.runtime.token })).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'UNAUTHORIZED' },
+    });
+    await expect(
+      daemon.shutdown({ token: daemon.runtime.token, skipChallengeVerify: true }),
+    ).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'UNAUTHORIZED' },
+    });
+    expect(fs.existsSync(paths.infoPath)).toBe(true);
 
     const deniedRpc = await quiesceOverHttp(daemon, {}, (params) => ({
       ...buildDaemonLifecycleRequest(params),
@@ -945,7 +968,7 @@ test('control server stays bound across active teardown after tenant listeners c
     expect(fs.existsSync(paths.infoPath)).toBe(false);
     await expect(
       sendControlCommand(daemon.runtime.controlPort!, {
-        token: daemon.runtime.token,
+        token: daemon.runtime.controlSecret!,
         fence: {
           pid: daemon.runtime.identity.pid,
           processStartTime: daemon.runtime.identity.startTime,

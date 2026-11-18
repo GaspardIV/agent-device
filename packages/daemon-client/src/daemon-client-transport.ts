@@ -847,6 +847,7 @@ async function sendHttpRequest(
         req,
         stateDir: statePaths.baseDir,
         host: options.host,
+        clearDeadline,
         resolve: resolveOnce,
         reject: rejectOnce,
       });

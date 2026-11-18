@@ -28,11 +28,12 @@ export function handleDaemonHttpResponseBody(
     req: DaemonWireRequest;
     stateDir: string;
     host: HostEnvironment;
+    clearDeadline?: () => void;
     resolve: (response: DaemonResponse | PromiseLike<DaemonResponse>) => void;
     reject: (error: unknown) => void;
   },
 ): void {
-  const { info, req, stateDir, host, resolve, reject } = options;
+  const { info, req, stateDir, host, clearDeadline, resolve, reject } = options;
   try {
     const parsed = parseDaemonHttpResponseBody(body);
     if (parsed.error) {
@@ -61,6 +62,9 @@ export function handleDaemonHttpResponseBody(
       );
       return;
     }
+    // Bound only the RPC answer (and error localization above); once a valid result envelope arrives,
+    // artifact downloads run under their own transfer budgets instead of racing this request deadline.
+    clearDeadline?.();
     void resolveDaemonHttpResult(
       info,
       req,

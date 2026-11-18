@@ -156,6 +156,16 @@ function mockControlHmacHelperSource(): string {
 function hmac(token, fields) {
   return crypto.createHmac('sha256', token).update(JSON.stringify(fields)).digest('hex');
 }
+function finishDrain(server, infoPath, reportPath, released = []) {
+  if (reportPath) {
+    fs.writeFileSync(reportPath, JSON.stringify({
+      providerReleases: { released, pending: [] },
+      claims: { released: [], orphaned: [], superseded: [], unattributable: [] },
+    }) + '\\n');
+  }
+  fs.rmSync(infoPath, { force: true });
+  server.close(() => process.exit(0));
+}
 function createControlServer(token, infoPath, onCommand) {
   let cachedStartTime = null;
   const readStartTime = () => {
@@ -256,9 +266,10 @@ async function withMockStopDaemon(
   const daemon = spawn(process.execPath, [entry], { stdio: ['ignore', 'pipe', 'pipe'] });
   try {
     const [line] = await once(daemon.stdout!, 'data');
-    const { port, controlPort, token } = JSON.parse(String(line).trim()) as {
+    const { port, controlPort, controlSecret, token } = JSON.parse(String(line).trim()) as {
       port?: number;
       controlPort?: number;
+      controlSecret?: string;
       token: string;
     };
     const processStartTime = readProcessStartTime(daemon.pid!);
@@ -272,6 +283,7 @@ async function withMockStopDaemon(
       ownership: 'detached',
       ...(transportKind === 'http' ? { httpPort: port } : { port }),
       ...(controlPort !== undefined ? { controlPort } : {}),
+      ...(controlSecret !== undefined ? { controlSecret } : {}),
       transport: transportKind,
       token,
       capabilities: options?.capabilities ?? DAEMON_CAPABILITIES,
@@ -293,24 +305,20 @@ import net from 'node:net';
 ${mockControlHmacHelperSource()}
 const infoPath = ${JSON.stringify(infoPath)};
 const reportPath = ${JSON.stringify(reportPath)};
-const token = 'test-daemon-token';
-const server = createControlServer(token, infoPath, ({ msg, respond }) => {
+const token = 'test-http-token';
+const controlSecret = 'test-control-secret';
+const server = createControlServer(controlSecret, infoPath, ({ msg, respond }) => {
   if (msg.command === ${JSON.stringify(DAEMON_SHUTDOWN_COMMAND)} && msg.pid === process.pid) {
-    respond({ ok: true, data: { outcome: 'draining' } }, () => {
-      fs.writeFileSync(reportPath, JSON.stringify({
-        providerReleases: { released: [{ leaseId: 'lease-1', provider: 'browserstack' }], pending: [] },
-        claims: { released: [], orphaned: [], superseded: [], unattributable: [] },
-      }) + '\\n');
-      fs.rmSync(infoPath, { force: true });
-      server.close(() => process.exit(0));
-    });
+    respond({ ok: true, data: { outcome: 'draining' } }, () =>
+      finishDrain(server, infoPath, reportPath, [{ leaseId: 'lease-1', provider: 'browserstack' }]),
+    );
     return;
   }
   respond({ ok: false, error: { code: 'INVALID_ARGS', message: 'unexpected request' } });
 });
 server.listen(0, '127.0.0.1', () => {
   const port = server.address().port;
-  console.log(JSON.stringify({ port, controlPort: port, token }));
+  console.log(JSON.stringify({ port, controlPort: port, controlSecret, token }));
 });`,
     async ({ paths, daemon }) => {
       const signals = vi.spyOn(process, 'kill');
@@ -381,13 +389,14 @@ test('stopRecordedDaemon falls back to signal retirement when control rejects da
     ({ infoPath }) => `import fs from 'node:fs';
 import net from 'node:net';
 ${mockControlHmacHelperSource()}
-const token = 'legacy-token';
-const control = createControlServer(token, ${JSON.stringify(infoPath)}, ({ respond }) => {
+const token = 'legacy-http-token';
+const controlSecret = 'legacy-control-secret';
+const control = createControlServer(controlSecret, ${JSON.stringify(infoPath)}, ({ respond }) => {
   respond({ ok: false, error: { code: 'SESSION_NOT_FOUND', message: 'No active session.' } });
 });
 control.listen(0, '127.0.0.1', () => {
   const controlPort = control.address().port;
-  console.log(JSON.stringify({ port: controlPort, controlPort, token }));
+  console.log(JSON.stringify({ port: controlPort, controlPort, controlSecret, token }));
 });`,
     async ({ paths, daemon }) => {
       const exited = once(daemon, 'exit');
@@ -411,9 +420,10 @@ test('stopRecordedDaemon retries control daemon-busy while starting up and exits
 import net from 'node:net';
 ${mockControlHmacHelperSource()}
 const infoPath = ${JSON.stringify(infoPath)};
-const token = 'startup-token';
+const token = 'startup-http-token';
+const controlSecret = 'startup-control-secret';
 let attempts = 0;
-const server = createControlServer(token, infoPath, ({ respond }) => {
+const server = createControlServer(controlSecret, infoPath, ({ respond }) => {
   attempts += 1;
   if (attempts === 1) {
     respond({
@@ -440,7 +450,7 @@ const server = createControlServer(token, infoPath, ({ respond }) => {
 });
 server.listen(0, '127.0.0.1', () => {
   const controlPort = server.address().port;
-  console.log(JSON.stringify({ port: controlPort, controlPort, token }));
+  console.log(JSON.stringify({ port: controlPort, controlPort, controlSecret, token }));
 });`,
     async ({ paths, daemon }) => {
       const signals = vi.spyOn(process, 'kill');
@@ -465,8 +475,9 @@ test('stopRecordedDaemon preserves embedded-owner refusal when control reports e
     ({ infoPath }) => `import fs from 'node:fs';
 import net from 'node:net';
 ${mockControlHmacHelperSource()}
-const token = 'embedded-token';
-const server = createControlServer(token, ${JSON.stringify(infoPath)}, ({ respond }) => {
+const token = 'embedded-http-token';
+const controlSecret = 'embedded-control-secret';
+const server = createControlServer(controlSecret, ${JSON.stringify(infoPath)}, ({ respond }) => {
   respond({
     ok: false,
     error: {
@@ -478,7 +489,7 @@ const server = createControlServer(token, ${JSON.stringify(infoPath)}, ({ respon
 });
 server.listen(0, '127.0.0.1', () => {
   const controlPort = server.address().port;
-  console.log(JSON.stringify({ port: controlPort, controlPort, token }));
+  console.log(JSON.stringify({ port: controlPort, controlPort, controlSecret, token }));
 });`,
     async ({ paths, daemon, record }) => {
       const signals = vi.spyOn(process, 'kill');
@@ -509,21 +520,15 @@ import net from 'node:net';
 ${mockControlHmacHelperSource()}
 const infoPath = ${JSON.stringify(infoPath)};
 const reportPath = ${JSON.stringify(reportPath)};
-const token = 'slow-token';
-const server = createControlServer(token, infoPath, () => {
+const token = 'slow-http-token';
+const controlSecret = 'slow-control-secret';
+const server = createControlServer(controlSecret, infoPath, () => {
   // Simulate an authenticated daemon that received shutdown and is draining past the control read timeout.
-  setTimeout(() => {
-    fs.writeFileSync(reportPath, JSON.stringify({
-      providerReleases: { released: [], pending: [] },
-      claims: { released: [], orphaned: [], superseded: [], unattributable: [] },
-    }) + '\\n');
-    fs.rmSync(infoPath, { force: true });
-    server.close(() => process.exit(0));
-  }, 300);
+  setTimeout(() => finishDrain(server, infoPath, reportPath), 300);
 });
 server.listen(0, '127.0.0.1', () => {
   const controlPort = server.address().port;
-  console.log(JSON.stringify({ port: controlPort, controlPort, token }));
+  console.log(JSON.stringify({ port: controlPort, controlPort, controlSecret, token }));
 });`,
     async ({ paths, daemon }) => {
       const signals = vi.spyOn(process, 'kill');
@@ -556,26 +561,20 @@ import net from 'node:net';
 ${mockControlHmacHelperSource()}
 const infoPath = ${JSON.stringify(infoPath)};
 const reportPath = ${JSON.stringify(reportPath)};
-const token = 'post-dispatch-token';
-const server = createControlServer(token, infoPath, ({ socket }) => {
+const token = 'post-dispatch-http-token';
+const controlSecret = 'post-dispatch-control-secret';
+const server = createControlServer(controlSecret, infoPath, ({ socket }) => {
   if (${JSON.stringify(mode)} === 'truncate') {
     socket.write('{"type":"command_response","version":1,"payload":"{\\"ok\\":true');
     socket.end();
   } else {
     socket.resetAndDestroy();
   }
-  setTimeout(() => {
-    fs.writeFileSync(reportPath, JSON.stringify({
-      providerReleases: { released: [], pending: [] },
-      claims: { released: [], orphaned: [], superseded: [], unattributable: [] },
-    }) + '\\n');
-    fs.rmSync(infoPath, { force: true });
-    server.close(() => process.exit(0));
-  }, 150);
+  setTimeout(() => finishDrain(server, infoPath, reportPath), 150);
 });
 server.listen(0, '127.0.0.1', () => {
   const port = server.address().port;
-  console.log(JSON.stringify({ port, controlPort: port, token }));
+  console.log(JSON.stringify({ port, controlPort: port, controlSecret, token }));
 });`,
       async ({ paths, daemon }) => {
         const signals = vi.spyOn(process, 'kill');
@@ -604,7 +603,14 @@ const probe = net.createServer();
 probe.listen(0, '127.0.0.1', () => {
   const closedPort = probe.address().port;
   probe.close(() => {
-    console.log(JSON.stringify({ port: closedPort, controlPort: closedPort, token: 'gone-active' }));
+    console.log(
+      JSON.stringify({
+        port: closedPort,
+        controlPort: closedPort,
+        controlSecret: 'gone-active-secret',
+        token: 'gone-active',
+      }),
+    );
   });
 });
 setInterval(() => {}, 1000);`,
@@ -634,7 +640,14 @@ const probe = net.createServer();
 probe.listen(0, '127.0.0.1', () => {
   const closedPort = probe.address().port;
   probe.close(() => {
-    console.log(JSON.stringify({ port: closedPort, controlPort: closedPort, token: 'gone-finished' }));
+    console.log(
+      JSON.stringify({
+        port: closedPort,
+        controlPort: closedPort,
+        controlSecret: 'gone-finished-secret',
+        token: 'gone-finished',
+      }),
+    );
   });
 });
 const watch = setInterval(() => {
@@ -686,8 +699,9 @@ test('stopDaemonForTakeover uses graceful shutdown control in graceful mode with
 import net from 'node:net';
 ${mockControlHmacHelperSource()}
 const infoPath = ${JSON.stringify(infoPath)};
-const token = 'takeover-token';
-const server = createControlServer(token, infoPath, ({ respond }) => {
+const token = 'takeover-http-token';
+const controlSecret = 'takeover-control-secret';
+const server = createControlServer(controlSecret, infoPath, ({ respond }) => {
   respond({ ok: true, data: { outcome: 'draining' } }, () => {
     fs.rmSync(infoPath, { force: true });
     server.close(() => process.exit(0));
@@ -695,7 +709,7 @@ const server = createControlServer(token, infoPath, ({ respond }) => {
 });
 server.listen(0, '127.0.0.1', () => {
   const controlPort = server.address().port;
-  console.log(JSON.stringify({ port: controlPort, controlPort, token }));
+  console.log(JSON.stringify({ port: controlPort, controlPort, controlSecret, token }));
 });`,
     async ({ paths, daemon }) => {
       const info = readDaemonInfo(paths.infoPath);
@@ -758,12 +772,13 @@ import http from 'node:http';
 import net from 'node:net';
 ${mockControlHmacHelperSource()}
 const infoPath = ${JSON.stringify(infoPath)};
-const token = 'reusable-token';
+const token = 'reusable-http-token';
+const controlSecret = 'reusable-control-secret';
 const httpServer = http.createServer((_req, res) => {
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ ok: true }));
 });
-const control = createControlServer(token, infoPath, ({ respond }) => {
+const control = createControlServer(controlSecret, infoPath, ({ respond }) => {
   respond({ ok: true, data: { outcome: 'draining' } }, () => {
     fs.rmSync(infoPath, { force: true });
     httpServer.close();
@@ -775,6 +790,7 @@ httpServer.listen(0, '127.0.0.1', () => {
     console.log(JSON.stringify({
       port: httpServer.address().port,
       controlPort: control.address().port,
+      controlSecret,
       token,
     }));
   });
@@ -800,19 +816,26 @@ httpServer.listen(0, '127.0.0.1', () => {
   );
 });
 
-test('readReusableLocalDaemon skips graceful control shutdown when decision cause is unreachable', async () => {
+test('readReusableLocalDaemon queries controlPort and waits for active drain without signalling when data listeners closed mid-drain', async () => {
   const localIdentity = await resolveLocalDaemonCodeIdentity();
   await withMockStopDaemon(
-    'agent-device-reusable-unreachable-',
+    'agent-device-reusable-draining-ctrl-',
     'socket',
-    ({ baseDir }) => `import fs from 'node:fs';
+    ({ baseDir, infoPath, reportPath }) => `import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-const marker = path.join(${JSON.stringify(baseDir)}, 'control-connected.txt');
+${mockControlHmacHelperSource()}
+const infoPath = ${JSON.stringify(infoPath)};
+const reportPath = ${JSON.stringify(reportPath)};
+const controlMarker = path.join(${JSON.stringify(baseDir)}, 'control-connected.txt');
+const token = 'draining-http-token';
+const controlSecret = 'draining-control-secret';
 const closed = net.createServer();
-const control = net.createServer((socket) => {
-  fs.writeFileSync(marker, 'connected');
-  socket.destroy();
+const control = createControlServer(controlSecret, infoPath, ({ respond }) => {
+  fs.writeFileSync(controlMarker, '1');
+  respond({ ok: true, data: { outcome: 'draining' } }, () => {
+    setTimeout(() => finishDrain(control, infoPath, reportPath), 80);
+  });
 });
 closed.listen(0, '127.0.0.1', () => {
   const closedPort = closed.address().port;
@@ -821,7 +844,8 @@ closed.listen(0, '127.0.0.1', () => {
       console.log(JSON.stringify({
         port: closedPort,
         controlPort: control.address().port,
-        token: 'unreachable-token',
+        controlSecret,
+        token,
       }));
     });
   });
@@ -837,10 +861,54 @@ closed.listen(0, '127.0.0.1', () => {
         transportPreference: 'socket',
         serverMode: 'socket',
       });
+      const [exitCode] = await exited;
+
+      expect(reusable).toBeNull();
+      expect(exitCode).toBe(0);
+      expect(fs.existsSync(path.join(baseDir, 'control-connected.txt'))).toBe(true);
+      expect(signals.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([]);
+    },
+    {
+      version: readVersion(),
+      codeOrigin: localIdentity.origin,
+      codeSignature: localIdentity.origin === 'checkout' ? localIdentity.codeSignature : undefined,
+    },
+  );
+});
+
+test('readReusableLocalDaemon escalates with identity check when data and control listeners are unreachable while daemon.json stays active', async () => {
+  const localIdentity = await resolveLocalDaemonCodeIdentity();
+  await withMockStopDaemon(
+    'agent-device-reusable-unreachable-',
+    'socket',
+    () => `import net from 'node:net';
+const probe = net.createServer();
+probe.listen(0, '127.0.0.1', () => {
+  const closedPort = probe.address().port;
+  probe.close(() => {
+    console.log(JSON.stringify({
+      port: closedPort,
+      controlPort: closedPort,
+      controlSecret: 'unreachable-control-secret',
+      token: 'unreachable-token',
+    }));
+  });
+});
+setInterval(() => {}, 1000);`,
+    async ({ paths, daemon }) => {
+      const signals = vi.spyOn(process, 'kill');
+      const exited = once(daemon, 'exit');
+      const reusable = await readReusableLocalDaemon({
+        host: createTestHostEnvironment(),
+        paths,
+        daemonLifecycle: 'managed',
+        retireIncompatibleContender: true,
+        transportPreference: 'socket',
+        serverMode: 'socket',
+      });
       await exited;
 
       expect(reusable).toBeNull();
-      expect(fs.existsSync(path.join(baseDir, 'control-connected.txt'))).toBe(false);
       expect(signals.mock.calls.filter(([, signal]) => signal !== 0).length).toBeGreaterThan(0);
     },
     {
@@ -862,28 +930,25 @@ ${mockControlHmacHelperSource()}
 const infoPath = ${JSON.stringify(infoPath)};
 const reportPath = ${JSON.stringify(reportPath)};
 const drainStartedPath = path.join(${JSON.stringify(baseDir)}, 'drain-started.txt');
-const token = 'concurrent-token';
+const token = 'concurrent-http-token';
+const controlSecret = 'concurrent-control-secret';
 let stopCalls = 0;
-const server = createControlServer(token, infoPath, ({ respond }) => {
+const server = createControlServer(controlSecret, infoPath, ({ respond }) => {
   stopCalls += 1;
   respond({ ok: true, data: { outcome: 'draining' } }, () => {
     if (stopCalls === 1) {
       fs.writeFileSync(drainStartedPath, '1');
       return;
     }
-    setTimeout(() => {
-      fs.writeFileSync(reportPath, JSON.stringify({
-        providerReleases: { released: [{ leaseId: 'lease-concurrent', provider: 'limrun' }], pending: [] },
-        claims: { released: [], orphaned: [], superseded: [], unattributable: [] },
-      }) + '\\n');
-      fs.rmSync(infoPath, { force: true });
-      server.close(() => process.exit(0));
-    }, 50);
+    setTimeout(
+      () => finishDrain(server, infoPath, reportPath, [{ leaseId: 'lease-concurrent', provider: 'limrun' }]),
+      50,
+    );
   });
 });
 server.listen(0, '127.0.0.1', () => {
   const controlPort = server.address().port;
-  console.log(JSON.stringify({ port: controlPort, controlPort, token }));
+  console.log(JSON.stringify({ port: controlPort, controlPort, controlSecret, token }));
 });`,
     async ({ baseDir, paths, daemon }) => {
       const identity = readDaemonStopIdentity(paths.infoPath);

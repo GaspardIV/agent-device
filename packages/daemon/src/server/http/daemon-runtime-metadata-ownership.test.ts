@@ -243,7 +243,7 @@ test('the loss watch is armed only after this daemon publishes its own record', 
   // Arming before publication would report a predecessor's record as a takeover of something this
   // daemon never owned. Ordering is the invariant, the same way the startup-ordering guards read it.
   const source = fs.readFileSync(new URL('./daemon-runtime.ts', import.meta.url), 'utf8');
-  const published = source.indexOf('publishDaemonInfo(socketPort, httpPort);');
+  const published = source.indexOf('publishDaemonInfo(socketPort, httpPort, controlPort);');
   const armed = source.indexOf('stopMetadataLossWatch = armDaemonMetadataLossWatch(');
 
   expect(published).toBeGreaterThanOrEqual(0);

@@ -54,6 +54,7 @@ export type DaemonRegistrationFields = Readonly<{
   socketPort?: number;
   httpPort?: number;
   controlPort?: number;
+  controlSecret?: string;
   token: string;
   version: string;
   codeOrigin: DaemonCodeOrigin;
