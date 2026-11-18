@@ -169,10 +169,9 @@ export async function stopDaemonForTakeover(
 ): Promise<DaemonRetirementResult> {
   // Optional `host` preserves callers like unreachable-daemon replacement (`replaceUnreachable`, already
   // known non-responsive on probes) and existing tests without firing RPCs or breaking R86 process-global rules.
-  const gracefulShutdown =
-    host && mode === 'graceful'
-      ? createGracefulDaemonShutdown(existing, { paths, host })
-      : undefined;
+  const gracefulShutdown = host
+    ? createGracefulDaemonShutdown(existing, { paths, host })
+    : undefined;
   return await stopAndRetireDaemon({
     paths: paths,
     observed: observedDaemonIdentityOf(existing),

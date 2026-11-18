@@ -18,6 +18,7 @@ import {
 export type DaemonInfo = {
   port?: number;
   httpPort?: number;
+  controlPort?: number;
   transport?: DaemonServerMode;
   token: string;
   pid: number;
@@ -151,9 +152,11 @@ function readDaemonInfoFromRecord(
   ports: Pick<DaemonInfo, 'port' | 'httpPort'>,
   pid: number,
 ): DaemonInfo {
+  const controlPort = readDaemonPort(parsed.controlPort);
   return {
     token,
     ...ports,
+    ...(controlPort !== undefined ? { controlPort } : {}),
     transport: readRecordedDaemonTransport(parsed.transport),
     pid,
     version: readOptionalString(parsed.version),

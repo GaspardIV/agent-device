@@ -240,6 +240,109 @@ test('socket malformed response stays typed at the daemon client seam', async ()
   );
 });
 
+test('HTTP malformed nested error fields settle promptly without hanging or unhandled rejections', async () => {
+  const endpoint = await startHttpServer((_request, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'boundary-malformed-error',
+        error: {
+          message: { toString: null },
+          data: {
+            code: { toString: null },
+            diagnosticsRecord: 123,
+          },
+        },
+      }),
+    );
+  });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const request = buildRequest(COMMAND_ROWS.read, 'malformed-error');
+    const startedAt = Date.now();
+    await assert.rejects(
+      sendRequest(
+        { httpPort: endpoint.port, token: 'test-token', pid: process.pid },
+        request,
+        'http',
+        daemonPaths(),
+        1_000,
+        { host: createTestHostEnvironment() },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof AppError);
+        assert.equal(error.details?.reason, 'daemon_response_invalid');
+        return true;
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(Date.now() - startedAt < 500, 'malformed error should reject before deadline');
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('HTTP deadline stays armed through async remote error localization until settlement', async () => {
+  const endpoint = await startHttpServer((req, response) => {
+    if (req.method === 'GET' && req.url === '/health') {
+      response.setHeader('content-type', 'application/json');
+      response.end(
+        JSON.stringify({ ok: true, service: 'agent-device-daemon', rpcProtocolVersion: 2 }),
+      );
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/rpc') {
+      response.setHeader('content-type', 'application/json');
+      response.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'boundary-stalled-localize',
+          error: {
+            code: -32000,
+            message: 'remote command failed',
+            data: {
+              code: 'COMMAND_FAILED',
+              message: 'remote command failed',
+              logPath: '/remote/daemon.log',
+              diagnosticsRecord: {
+                session: 'boundary-faults',
+                requestId: 'boundary-stalled-localize',
+              },
+            },
+          },
+        }),
+      );
+      return;
+    }
+    // Intentionally leave the diagnostics GET hanging past the RPC deadline.
+  });
+
+  const request = buildRequest(COMMAND_ROWS.read, 'stalled-localize');
+  const startedAt = Date.now();
+  await assert.rejects(
+    sendRequest(
+      { baseUrl: `http://127.0.0.1:${endpoint.port}`, token: 'test-token', pid: process.pid },
+      request,
+      'http',
+      daemonPaths(),
+      120,
+      { host: createTestHostEnvironment() },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal(error.details?.reason, 'daemon_transport_timeout');
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 1_000, 'deadline must reject stalled remote localization');
+});
+
 function buildRequest(
   row: { command: string; positionals: readonly string[] },
   suffix: string,

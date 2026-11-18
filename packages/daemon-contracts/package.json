@@ -12,6 +12,10 @@
     "@agent-device/kernel": "workspace:*"
   },
   "exports": {
+    "./daemon-control": {
+      "types": "./src/daemon-control.ts",
+      "default": "./src/daemon-control.ts"
+    },
     "./daemon-diagnostics-scope": {
       "types": "./src/daemon-diagnostics-scope.ts",
       "default": "./src/daemon-diagnostics-scope.ts"

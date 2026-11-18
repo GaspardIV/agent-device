@@ -219,3 +219,53 @@ test('lease allocation carries the device spec a proxy backend picks by', () => 
     physical: true,
   });
 });
+
+test('HTTP RPC response parser rejects malformed error envelopes and nested field types without throwing', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const cases = [
+      'null',
+      '[]',
+      '{}',
+      JSON.stringify({ error: 'boom' }),
+      JSON.stringify({ error: { message: { toString: null } } }),
+      JSON.stringify({ error: { data: 'not-an-object' } }),
+      JSON.stringify({ error: { data: { code: 123 } } }),
+      JSON.stringify({ error: { data: { message: { toString: null } } } }),
+      JSON.stringify({ error: { data: { details: ['not-a-record'] } } }),
+      JSON.stringify({ error: { data: { diagnosticsRecord: 123 } } }),
+      JSON.stringify({ result: [] }),
+      JSON.stringify({ result: { ok: 'yes' } }),
+    ];
+
+    for (const body of cases) {
+      let settledError: unknown;
+      handleDaemonHttpResponseBody(body, {
+        host: createTestHostEnvironment(),
+        info: { token: 'daemon-token', pid: 1 },
+        req: {
+          command: 'status',
+          positionals: [],
+          token: 'daemon-token',
+          session: 'test-session',
+          meta: { requestId: 'malformed-envelope' },
+        },
+        stateDir: '/tmp/agent-device-test',
+        resolve: () => assert.fail(`Expected rejection for ${body}`),
+        reject: (error) => {
+          settledError = error;
+        },
+      });
+      assert.ok(settledError instanceof AppError, `expected AppError for ${body}`);
+      assert.equal(settledError.details?.reason, 'daemon_response_invalid');
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});

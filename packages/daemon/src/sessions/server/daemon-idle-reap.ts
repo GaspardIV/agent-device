@@ -1,7 +1,10 @@
 import {
+  DAEMON_QUIESCE_COMMAND,
+  type DaemonControlCommand,
+} from '@agent-device/daemon-contracts/daemon-control';
+import {
   DAEMON_LIFECYCLE_REASONS,
   DAEMON_SHUTTING_DOWN_REASON,
-  DAEMON_QUIESCE_COMMAND,
   DAEMON_SHUTDOWN_COMMAND,
   readDaemonLifecycleFence,
   type DaemonLifecycleCensus,
@@ -190,6 +193,8 @@ export function createDaemonIdleReap(params: {
 export type DaemonLifecycleAdmission = Readonly<{
   /** Closes admission when any owner starts draining the runtime. */
   close(): void;
+  /** Runs an already-authenticated local control command against admission state. */
+  control(command: DaemonControlCommand, fence: DaemonLifecycleFence): DaemonResponse;
   /**
    * Puts the lifecycle request and the closed admission it leaves behind in front of `handler`: a
    * lifecycle request gets its verdict, and any other request gets the shutting-down refusal once a
@@ -229,18 +234,10 @@ export function createDaemonLifecycleAdmission(params: {
     error: normalizeError(error),
   });
 
-  const leave = (req: DaemonRequest, options: { requireIdle: boolean }): DaemonResponse => {
-    // A remote client reaches this daemon through the proxy with the shared token, and only the
-    // host that owns the state directory may retire the daemon on it.
-    if (req.internal?.publicNetworkOnly) {
-      return refuse(
-        new AppError(
-          'UNAUTHORIZED',
-          `Daemon ${options.requireIdle ? 'quiesce' : 'shutdown'} is not available to remote clients.`,
-        ),
-      );
-    }
-    const fence = readDaemonLifecycleFence(req.input);
+  const admitLeave = (
+    fence: DaemonLifecycleFence | undefined,
+    options: { requireIdle: boolean },
+  ): DaemonResponse => {
     // A pid alone can name a recycled process, so a daemon that cannot prove its start time
     // cannot be addressed at all.
     if (!fence || fence.pid !== params.identity.pid) return refuse(instanceMismatch());
@@ -268,6 +265,20 @@ export function createDaemonLifecycleAdmission(params: {
     return { ok: true, data: { outcome: 'draining' } };
   };
 
+  const leave = (req: DaemonRequest, options: { requireIdle: boolean }): DaemonResponse => {
+    // A remote client reaches this daemon through the proxy with the shared token, and only the
+    // host that owns the state directory may retire the daemon on it.
+    if (req.internal?.publicNetworkOnly) {
+      return refuse(
+        new AppError(
+          'UNAUTHORIZED',
+          `Daemon ${options.requireIdle ? 'quiesce' : 'shutdown'} is not available to remote clients.`,
+        ),
+      );
+    }
+    return admitLeave(readDaemonLifecycleFence(req.input), options);
+  };
+
   const readCensus = (): DaemonLifecycleCensus => {
     const sessions = params.sessionStore.toArray();
     const repairSessions = sessions.filter(isUncommittedRepairSession).length;
@@ -284,12 +295,23 @@ export function createDaemonLifecycleAdmission(params: {
     close: () => {
       admitting = false;
     },
+    control: (command, fence) =>
+      admitLeave(fence, { requireIdle: command === DAEMON_QUIESCE_COMMAND }),
     admit: (handler) => async (req) => {
       if (typeof req.token !== 'string' || !timingSafeStringEqual(req.token, params.token)) {
         return refuse(new AppError('UNAUTHORIZED', 'Invalid daemon token.'));
       }
       if (req.command === DAEMON_QUIESCE_COMMAND) return leave(req, { requireIdle: true });
-      if (req.command === DAEMON_SHUTDOWN_COMMAND) return leave(req, { requireIdle: false });
+      if (req.command === DAEMON_SHUTDOWN_COMMAND) {
+        return refuse(
+          new AppError(
+            'UNAUTHORIZED',
+            req.internal?.publicNetworkOnly
+              ? 'Daemon shutdown is not available to remote clients.'
+              : 'Daemon shutdown is only available on the local control channel.',
+          ),
+        );
+      }
       return admitting ? await handler(req) : daemonShuttingDownResponse();
     },
   };

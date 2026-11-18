@@ -254,34 +254,11 @@ export function buildDaemonLifecycleRequest(params: {
   fence: DaemonLifecycleFence;
   requestId: string;
 }): DaemonWireRequest {
-  return buildDaemonControlRequest(DAEMON_QUIESCE_COMMAND, params);
-}
-
-/**
- * Fenced shutdown request for an explicit daemon stop, so a daemon whose OS signals terminate
- * abruptly (such as Win32 `SIGTERM`) can flush its shutdown report and release active leases.
- */
-export function buildDaemonShutdownRequest(params: {
-  token: string;
-  fence: DaemonLifecycleFence;
-  requestId: string;
-}): DaemonWireRequest {
-  return buildDaemonControlRequest(DAEMON_SHUTDOWN_COMMAND, params);
-}
-
-function buildDaemonControlRequest(
-  command: typeof DAEMON_QUIESCE_COMMAND | typeof DAEMON_SHUTDOWN_COMMAND,
-  params: {
-    token: string;
-    fence: DaemonLifecycleFence;
-    requestId: string;
-  },
-): DaemonWireRequest {
   const { token, fence, requestId } = params;
   return {
     token,
     session: 'default',
-    command,
+    command: DAEMON_QUIESCE_COMMAND,
     positionals: [],
     input: { pid: fence.pid, processStartTime: fence.processStartTime },
     meta: { requestId },

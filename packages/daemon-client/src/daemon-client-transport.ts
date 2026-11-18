@@ -820,18 +820,24 @@ async function sendHttpRequest(
     let settled = false;
     // Set when the request was handed to the OS (`finish`), never for a connection that failed first.
     let requestSent = false;
+    const deadline: { handle?: ReturnType<typeof setTimeout> } = {};
+    const clearDeadline = (): void => {
+      if (deadline.handle) clearTimeout(deadline.handle);
+    };
     const detachCallerAbort = (): void => {
       if (callerSignal) callerSignal.removeEventListener('abort', onCallerAbort);
     };
     const resolveOnce = (response: DaemonResponse | PromiseLike<DaemonResponse>): void => {
       if (settled) return;
       settled = true;
+      clearDeadline();
       detachCallerAbort();
       resolve(response);
     };
     const rejectOnce = (error: unknown): void => {
       if (settled) return;
       settled = true;
+      clearDeadline();
       detachCallerAbort();
       reject(error);
     };
@@ -857,7 +863,6 @@ async function sendHttpRequest(
       (res) => {
         if (isRemoteInstanceMismatchResponse(res.statusCode, res.headers ?? {})) {
           res.resume();
-          if (timeoutHandle) clearTimeout(timeoutHandle);
           rejectOnce(
             new AppError('COMMAND_FAILED', 'Remote daemon instance changed', {
               reason: 'remote_instance_mismatch',
@@ -871,9 +876,8 @@ async function sendHttpRequest(
             req,
             onProgress: options.onProgress,
             reject: rejectOnce,
-            clearTimeout: () => {
-              if (timeoutHandle) clearTimeout(timeoutHandle);
-            },
+            // Deadline stays active until `handleBody` settles `resolveOnce`/`rejectOnce`.
+            clearTimeout: () => undefined,
             handleResponseBody: handleBody,
           });
           return;
@@ -891,18 +895,16 @@ async function sendHttpRequest(
         });
         void responseBody
           .then((body) => {
-            if (timeoutHandle) clearTimeout(timeoutHandle);
             handleBody(body);
           })
           .catch((error: unknown) => {
-            if (timeoutHandle) clearTimeout(timeoutHandle);
             rejectOnce(error);
           });
       },
     );
 
     const remote = isRemoteDaemon(info);
-    const timeoutHandle =
+    deadline.handle =
       typeof timeoutMs === 'number'
         ? setTimeout(() => {
             rejectOnce(requestTimeoutError(timeoutMs, req.meta?.requestId, requestSent));
@@ -917,7 +919,6 @@ async function sendHttpRequest(
     // typed cancellation into a transport failure.
     const onCallerAbort = (): void => {
       if (settled) return;
-      if (timeoutHandle) clearTimeout(timeoutHandle);
       rejectOnce(
         abortedRequestError(callerSignal!, requestSent ? 'unknown' : 'no', req.meta?.requestId),
       );
@@ -928,7 +929,6 @@ async function sendHttpRequest(
     }
 
     request.on('error', (err) => {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
       // `request.destroy()` surfaces an `error` after an intentional abort or timeout has already
       // settled this promise. Returning before `handleTransportError` keeps that expected teardown
       // from emitting a `daemon_request_socket_error` diagnostic; a genuine transport error still

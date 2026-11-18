@@ -16,6 +16,7 @@ type DaemonInfo = {
   processStartTime?: string;
   transport?: string;
   httpPort?: number;
+  controlPort?: number;
 };
 
 test('daemon HTTP transport starts from CLI and accepts a command RPC', async (t) => {
@@ -86,6 +87,7 @@ function readDaemonInfo(stateDir: string): DaemonInfo {
 async function callCommandRpc(
   info: DaemonInfo,
   command: string,
+  input?: Record<string, unknown>,
 ): Promise<{ status: number; body: any }> {
   const response = await fetch(`http://127.0.0.1:${info.httpPort}/rpc`, {
     method: 'POST',
@@ -100,6 +102,7 @@ async function callCommandRpc(
         command,
         positionals: [],
         flags: {},
+        ...(input ? { input } : {}),
       },
     }),
   });
@@ -108,6 +111,57 @@ async function callCommandRpc(
     body: await response.json(),
   };
 }
+
+test('HTTP-only daemon with AGENT_DEVICE_HTTP_AUTH_HOOK refuses /rpc shutdown while CLI daemon stop completes gracefully', async (t) => {
+  if (await skipWhenLoopbackUnavailable(t)) {
+    return;
+  }
+
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-device-http-auth-stop-'));
+  const hookDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-device-http-auth-hook-'));
+  const hookPath = path.join(hookDir, 'deny-rpc-hook.mjs');
+  fs.writeFileSync(
+    hookPath,
+    'export default async function () { return { ok: false, code: "FORBIDDEN", message: "Denied by smoke auth hook" }; }\n',
+  );
+  let info: DaemonInfo | null = null;
+  try {
+    const cli = runCliJson(
+      ['session', 'list', '--json', '--daemon-transport', 'http', '--state-dir', stateDir],
+      {
+        env: {
+          ...process.env,
+          AGENT_DEVICE_DAEMON_SERVER_MODE: 'http',
+          AGENT_DEVICE_HTTP_AUTH_HOOK: hookPath,
+        },
+      },
+    );
+    assert.equal(
+      cli.status,
+      1,
+      formatResultDebug('blocked RPC under auth hook', ['session', 'list'], cli),
+    );
+    assert.match(cli.json?.error?.message ?? '', /Denied by smoke auth hook/);
+
+    info = readDaemonInfo(stateDir);
+    assert.equal(info.transport, 'http');
+    assert.equal(typeof info.httpPort, 'number');
+    assert.equal(typeof info.controlPort, 'number');
+
+    const shutdownRpc = await callCommandRpc(info, 'daemon_shutdown', {
+      pid: info.pid,
+      processStartTime: info.processStartTime ?? null,
+    });
+    assert.equal(shutdownRpc.status, 401);
+    assert.match(JSON.stringify(shutdownRpc.body), /Denied by smoke auth hook/);
+
+    await stopDaemon(stateDir, info);
+    await assertNoDaemonLeaks({ stateDir, daemonPids: [info.pid], phase: 'after-shutdown' });
+  } finally {
+    await cleanupDaemonTestState(stateDir, info);
+    fs.rmSync(hookDir, { recursive: true, force: true });
+  }
+});
 
 async function stopDaemon(stateDir: string, info: DaemonInfo): Promise<void> {
   if (!Number.isInteger(info.pid) || info.pid <= 0) return;

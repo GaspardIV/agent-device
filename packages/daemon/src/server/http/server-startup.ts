@@ -6,6 +6,7 @@ import {
 import { emitDiagnostic } from '@agent-device/host-kit/diagnostics';
 import type { DaemonServerMode } from '@agent-device/kernel/contracts';
 import type { EnvMap } from '@agent-device/kernel/source-value';
+import { createDaemonControlServer, type DaemonControlServerOptions } from './control-server.ts';
 import { createDaemonHttpServer } from './http-server.ts';
 import { closeDaemonServers, type StartupRollback } from './server-shutdown.ts';
 import {
@@ -20,11 +21,22 @@ export async function openDaemonServers(
   mode: DaemonServerMode,
   httpOptions: Parameters<typeof createDaemonHttpServer>[0],
   rollback: StartupRollback,
-): Promise<{ servers: DaemonServer[]; socketPort?: number; httpPort?: number }> {
+  controlOptions?: DaemonControlServerOptions,
+): Promise<{
+  servers: DaemonServer[];
+  controlServer?: DaemonServer;
+  socketPort?: number;
+  httpPort?: number;
+  controlPort?: number;
+}> {
   const servers: DaemonServer[] = [];
-  rollback.onRollback(() => closeDaemonServers(servers));
+  let controlServer: DaemonServer | undefined;
+  rollback.onRollback(() =>
+    closeDaemonServers(controlServer ? [...servers, controlServer] : servers),
+  );
   let socketPort: number | undefined;
   let httpPort: number | undefined;
+  let controlPort: number | undefined;
   if (mode !== 'http') {
     const server = createSocketServer(httpOptions.handleRequest);
     servers.push(server);
@@ -35,7 +47,11 @@ export async function openDaemonServers(
     servers.push(server);
     httpPort = await listenHttpServer(server);
   }
-  return { servers, socketPort, httpPort };
+  if (controlOptions) {
+    controlServer = createDaemonControlServer(controlOptions);
+    controlPort = await listenNetServer(controlServer);
+  }
+  return { servers, controlServer, socketPort, httpPort, controlPort };
 }
 
 export async function reconcileDeviceClaimsForDaemonStartup(

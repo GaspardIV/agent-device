@@ -37,7 +37,8 @@ export type DaemonServer = (net.Server | HttpServer) & {
   destroyConnections?: () => void;
 };
 
-export function createSocketServer(handleRequest: DaemonInvokeFn): DaemonServer {
+/** Creates a `net.Server` whose accepted sockets are tracked for bounded teardown. */
+export function createTrackedNetServer(onSocket: (socket: net.Socket) => void): DaemonServer {
   const sockets = new Set<net.Socket>();
   const server: DaemonServer = net.createServer((socket) => {
     // An accepted socket loses the runtime that is listening, so its callbacks keep it explicitly.
@@ -46,6 +47,19 @@ export function createSocketServer(handleRequest: DaemonInvokeFn): DaemonServer 
       'close',
       AsyncResource.bind(() => sockets.delete(socket)),
     );
+    onSocket(socket);
+  });
+  server.destroyConnections = () => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    sockets.clear();
+  };
+  return server;
+}
+
+export function createSocketServer(handleRequest: DaemonInvokeFn): DaemonServer {
+  return createTrackedNetServer((socket) => {
     let pending: PendingSocketRequest = EMPTY_PENDING_SOCKET_REQUEST;
     let inFlightRequests = 0;
     const activeRequestIds = new Set<string>();
@@ -140,13 +154,6 @@ export function createSocketServer(handleRequest: DaemonInvokeFn): DaemonServer 
     });
     socket.on('data', onData);
   });
-  server.destroyConnections = () => {
-    for (const socket of sockets) {
-      socket.destroy();
-    }
-    sockets.clear();
-  };
-  return server;
 }
 
 /** The unterminated tail of a connection's input, with its UTF-8 size kept as it grows. */

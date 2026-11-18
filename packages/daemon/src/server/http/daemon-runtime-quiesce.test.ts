@@ -1,13 +1,24 @@
 import fs from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 import { afterEach, expect, test, vi } from 'vitest';
 import { createTestHostEnvironment, mkdtempForTestSync } from '@agent-device/test-kit';
 import {
+  DAEMON_CONTROL_PROTOCOL_VERSION,
+  DAEMON_SHUTDOWN_COMMAND,
+  createDaemonControlNonce,
+  parseControlChallengeResponse,
+  parseControlCommandResponse,
+  signDaemonControlCommand,
+  verifyDaemonControlChallenge,
+  verifyDaemonControlReply,
+} from '@agent-device/daemon-contracts/daemon-control';
+import {
   buildDaemonLifecycleRequest,
-  buildDaemonShutdownRequest,
   resolveDaemonPaths,
   type DaemonRuntimeOwnership,
 } from '@agent-device/daemon-contracts/daemon-resolution';
+import { consumeTextLines } from '@agent-device/host-kit/transport';
 import { readDaemonShutdownReport } from '@agent-device/daemon-contracts/daemon-shutdown-report';
 import { readCurrentOwnerIdentity } from '@agent-device/host-kit/process';
 import type { DaemonResponse } from '@agent-device/kernel/contracts';
@@ -132,6 +143,7 @@ type Booted = {
   exit: Promise<number>;
   quiesce(overrides?: LifecycleAddress): Promise<DaemonResponse>;
   shutdown(overrides?: LifecycleAddress): Promise<DaemonResponse>;
+  shutdownOverSocket(overrides?: LifecycleAddress): Promise<DaemonResponse>;
   sessionList(): Promise<DaemonResponse>;
 };
 
@@ -146,22 +158,25 @@ type LifecycleAddress = {
 
 async function bootDaemon(
   options: {
-    serverMode?: 'socket' | 'dual';
+    serverMode?: 'socket' | 'http' | 'dual';
     ownership?: DaemonRuntimeOwnership;
     idleTimeoutMs?: number;
     requestDrainMs?: number;
+    authHookPath?: string;
+    composeDeps?: ReturnType<typeof daemonRuntimeDepsFixture>;
   } = {},
 ): Promise<Booted> {
   const stateDir = mkdtempForTestSync('agent-device-daemon-lifecycle-');
   const paths = resolveDaemonPaths(stateDir);
   const runtime = await startDaemonRuntime({
-    composeDeps: daemonRuntimeDepsFixture(),
+    composeDeps: options.composeDeps ?? daemonRuntimeDepsFixture(),
     host: createTestHostEnvironment({
       env: {
         ...process.env,
         AGENT_DEVICE_STATE_DIR: stateDir,
         AGENT_DEVICE_DAEMON_SERVER_MODE: options.serverMode ?? 'socket',
         AGENT_DEVICE_DAEMON_IDLE_TIMEOUT_MS: String(options.idleTimeoutMs ?? 0),
+        ...(options.authHookPath ? { AGENT_DEVICE_HTTP_AUTH_HOOK: options.authHookPath } : {}),
       },
     }),
     ownership: options.ownership,
@@ -170,27 +185,43 @@ async function bootDaemon(
     stderr: { write: () => {} },
     stdout: { write: () => {} },
   });
-  if (!runtime?.socketPort) throw new Error('daemon did not start');
+  if (!runtime?.controlPort || (!runtime.socketPort && !runtime.httpPort)) {
+    throw new Error('daemon did not start');
+  }
   const exit = runtime.closed.then(() => 0);
   const info = JSON.parse(fs.readFileSync(paths.infoPath, 'utf8')) as {
     pid: number;
     processStartTime?: string;
+    controlPort?: number;
   };
   const socketPort = runtime.socketPort;
-  const send = (request: object) => sendSocketRequest(socketPort, request);
+  const controlPort = runtime.controlPort;
+  const send = (request: object) => {
+    if (!socketPort) throw new Error('daemon socket server not enabled');
+    return sendSocketRequest(socketPort, request);
+  };
+  const resolveFence = (overrides: LifecycleAddress) => ({
+    pid: overrides.pid ?? info.pid,
+    processStartTime:
+      overrides.processStartTime !== undefined
+        ? overrides.processStartTime
+        : (info.processStartTime ?? null),
+  });
+  const buildShutdownProbeRequest = (params: {
+    token: string;
+    fence: { pid: number; processStartTime: string | null };
+    requestId: string;
+  }) => ({
+    ...buildDaemonLifecycleRequest(params),
+    command: DAEMON_SHUTDOWN_COMMAND,
+  });
   const sendLifecycle = (
     overrides: LifecycleAddress,
     build: typeof buildDaemonLifecycleRequest = buildDaemonLifecycleRequest,
   ) => {
     const request = build({
       token: overrides.token ?? runtime.token,
-      fence: {
-        pid: overrides.pid ?? info.pid,
-        processStartTime:
-          overrides.processStartTime !== undefined
-            ? overrides.processStartTime
-            : (info.processStartTime ?? null),
-      },
+      fence: resolveFence(overrides),
       requestId: overrides.requestId ?? 'quiesce-test',
     });
     return overrides.omitMeta ? send({ ...request, meta: undefined }) : send(request);
@@ -200,7 +231,14 @@ async function bootDaemon(
     stateDir,
     exit,
     quiesce: (overrides = {}) => sendLifecycle(overrides, buildDaemonLifecycleRequest),
-    shutdown: (overrides = {}) => sendLifecycle(overrides, buildDaemonShutdownRequest),
+    shutdown: (overrides = {}) =>
+      sendControlCommand(controlPort, {
+        token: overrides.token ?? runtime.token,
+        fence: resolveFence(overrides),
+        command: DAEMON_SHUTDOWN_COMMAND,
+        requestId: overrides.requestId ?? 'shutdown-test',
+      }),
+    shutdownOverSocket: (overrides = {}) => sendLifecycle(overrides, buildShutdownProbeRequest),
     sessionList: () =>
       send({
         token: runtime.token,
@@ -210,6 +248,116 @@ async function bootDaemon(
         meta: { requestId: 'session-list-test' },
       }),
   };
+}
+
+async function sendControlCommand(
+  controlPort: number,
+  options: {
+    token: string;
+    fence: { pid: number; processStartTime: string | null };
+    command: typeof DAEMON_SHUTDOWN_COMMAND;
+    requestId: string;
+  },
+): Promise<DaemonResponse> {
+  const clientNonce = createDaemonControlNonce();
+  return await new Promise<DaemonResponse>((resolve, reject) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port: controlPort });
+    let buffer = '';
+    let serverNonce = '';
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      fn();
+    };
+    socket.setEncoding('utf8');
+    socket.on('error', (err) => finish(() => reject(err)));
+    socket.on('close', () =>
+      finish(() =>
+        resolve({
+          ok: false,
+          error: { code: 'UNAUTHORIZED', message: 'Control connection closed before reply.' },
+        }),
+      ),
+    );
+    socket.on('connect', () => {
+      socket.write(
+        `${JSON.stringify({
+          type: 'challenge',
+          version: DAEMON_CONTROL_PROTOCOL_VERSION,
+          nonce: clientNonce,
+          requestId: options.requestId,
+        })}\n`,
+      );
+    });
+    socket.on('data', (chunk: string) => {
+      const next = consumeTextLines(buffer, chunk);
+      buffer = next.buffer;
+      for (const line of next.lines) {
+        if (!serverNonce) {
+          const challenge = parseControlChallengeResponse(line);
+          if (
+            !challenge ||
+            !verifyDaemonControlChallenge({
+              token: options.token,
+              fence: options.fence,
+              clientNonce,
+              serverNonce: challenge.serverNonce,
+              proof: challenge.proof,
+            })
+          ) {
+            finish(() =>
+              resolve({
+                ok: false,
+                error: { code: 'UNAUTHORIZED', message: 'Control challenge rejected.' },
+              }),
+            );
+            return;
+          }
+          serverNonce = challenge.serverNonce;
+          socket.write(
+            `${JSON.stringify({
+              type: 'command',
+              version: DAEMON_CONTROL_PROTOCOL_VERSION,
+              command: options.command,
+              clientNonce,
+              serverNonce,
+              pid: options.fence.pid,
+              processStartTime: options.fence.processStartTime,
+              requestId: options.requestId,
+              proof: signDaemonControlCommand({
+                token: options.token,
+                command: options.command,
+                fence: options.fence,
+                clientNonce,
+                serverNonce,
+                requestId: options.requestId,
+              }),
+            })}\n`,
+          );
+          continue;
+        }
+        const reply = parseControlCommandResponse(line);
+        if (
+          !reply ||
+          !verifyDaemonControlReply({
+            token: options.token,
+            fence: options.fence,
+            clientNonce,
+            serverNonce,
+            requestId: options.requestId,
+            payload: reply.payload,
+            proof: reply.proof,
+          })
+        ) {
+          finish(() => reject(new Error('Invalid control reply signature')));
+          return;
+        }
+        finish(() => resolve(JSON.parse(reply.payload) as DaemonResponse));
+      }
+    });
+  });
 }
 
 async function sendSocketRequest(port: number, request: object): Promise<DaemonResponse> {
@@ -500,6 +648,41 @@ test('a local HTTP quiesce drains an idle daemon like a socket one', async () =>
   expect(await daemon.exit).toBe(0);
 });
 
+test('an HTTP-only daemon with AGENT_DEVICE_HTTP_AUTH_HOOK refuses /rpc shutdown while local control stops cleanly', async () => {
+  const hookDir = mkdtempForTestSync('agent-device-http-auth-shutdown-');
+  const authHookPath = path.join(hookDir, 'deny-all-hook.mjs');
+  fs.writeFileSync(
+    authHookPath,
+    'export default async function () { return { ok: false, code: "FORBIDDEN", message: "Denied by auth hook" }; }\n',
+  );
+  const daemon = await bootDaemon({ serverMode: 'http', authHookPath });
+  const paths = resolveDaemonPaths(daemon.stateDir);
+  try {
+    const published = JSON.parse(fs.readFileSync(paths.infoPath, 'utf8')) as {
+      port?: number;
+      httpPort?: number;
+      controlPort?: number;
+    };
+    expect(published.port).toBeUndefined();
+    expect(published.httpPort).toBe(daemon.runtime.httpPort);
+    expect(published.controlPort).toBe(daemon.runtime.controlPort);
+
+    const deniedRpc = await quiesceOverHttp(daemon, {}, (params) => ({
+      ...buildDaemonLifecycleRequest(params),
+      command: DAEMON_SHUTDOWN_COMMAND,
+    }));
+    expect(JSON.stringify(deniedRpc)).toContain('Denied by auth hook');
+
+    expect(await daemon.shutdown()).toEqual({ ok: true, data: { outcome: 'draining' } });
+    expect(await daemon.exit).toBe(0);
+    expect(fs.existsSync(paths.infoPath)).toBe(false);
+    expect(fs.existsSync(paths.lockPath)).toBe(false);
+  } finally {
+    await daemon.runtime.close();
+    fs.rmSync(hookDir, { recursive: true, force: true });
+  }
+});
+
 test('a host close retains registration and lock while a request ignores cancellation', async () => {
   const daemon = await bootDaemon({ ownership: 'embedded', requestDrainMs: 50 });
   const paths = resolveDaemonPaths(daemon.stateDir);
@@ -532,7 +715,7 @@ test('a diagnostic failure starts listener close, retains unproved work and pres
   const exited = expect(daemon.exit).rejects.toBe(primary);
   await expect(daemon.runtime.close({ cause: new Error('shutdown cause') })).rejects.toBe(primary);
   await exited;
-  expect(listeners).toHaveBeenCalledTimes(1);
+  expect(listeners).toHaveBeenCalledTimes(2);
   expect(fs.existsSync(paths.infoPath)).toBe(true);
   expect(fs.existsSync(paths.lockPath)).toBe(true);
 });
@@ -671,16 +854,28 @@ test('shutdown accepts active sessions and leases, writes the shutdown report, a
 
   const remote = await bootDaemon({ serverMode: 'dual' });
   try {
+    const tenantSocket = await remote.shutdownOverSocket();
+    expect(!tenantSocket.ok && tenantSocket.error.code).toBe('UNAUTHORIZED');
+    expect(!tenantSocket.ok && tenantSocket.error.message).toBe(
+      'Daemon shutdown is only available on the local control channel.',
+    );
+
     const body = await quiesceOverHttp(
       remote,
       { 'x-agent-device-network-access': 'public-only' },
-      buildDaemonShutdownRequest,
+      (params) => ({
+        ...buildDaemonLifecycleRequest(params),
+        command: DAEMON_SHUTDOWN_COMMAND,
+      }),
     );
     expect(JSON.stringify(body)).toContain('"UNAUTHORIZED"');
     expect(JSON.stringify(body)).toContain('Daemon shutdown is not available to remote clients.');
-    expect(reasonOf(await remote.shutdown({ processStartTime: 'other-start' }))).toBe(
-      'daemon-instance-mismatch',
-    );
+    expect(
+      !(await remote.shutdown({ token: 'wrong-token' })).ok &&
+        (await remote.shutdown({ token: 'wrong-token' })),
+    ).toMatchObject({ ok: false, error: { code: 'UNAUTHORIZED' } });
+    const mismatch = await remote.shutdown({ processStartTime: 'other-start' });
+    expect(!mismatch.ok && mismatch.error.code).toBe('UNAUTHORIZED');
     expect((await remote.sessionList()).ok).toBe(true);
   } finally {
     await remote.runtime.close();
@@ -707,6 +902,60 @@ test('shutdown accepts active sessions and leases, writes the shutdown report, a
       claims: { released: [], orphaned: [], superseded: [], unattributable: [] },
     });
   } finally {
+    await daemon.runtime.close();
+  }
+});
+
+test('control server stays bound across active teardown after tenant listeners close until daemon.json retires', async () => {
+  let releaseTeardown: () => void = () => {};
+  let notifyTeardownEntered: () => void = () => {};
+  const teardownEntered = new Promise<void>((resolve) => {
+    notifyTeardownEntered = resolve;
+  });
+  const teardownGate = new Promise<void>((resolve) => {
+    releaseTeardown = resolve;
+  });
+  const daemon = await bootDaemon({
+    serverMode: 'socket',
+    composeDeps: daemonRuntimeDepsFixture(() => ({
+      deviceRuntimeGateway: {
+        ...lifecycleDeviceRuntimeGateway,
+        applicationLifecycle: applicationLifecycleResourceFixture(),
+        shutdown: async () => {
+          notifyTeardownEntered();
+          await teardownGate;
+        },
+      },
+    })),
+  });
+  const paths = resolveDaemonPaths(daemon.stateDir);
+  try {
+    expect(await daemon.shutdown()).toEqual({ ok: true, data: { outcome: 'draining' } });
+    await teardownEntered;
+
+    // Tenant socket server has already closed at teardown start while daemon.json and controlPort remain live.
+    await expect(
+      sendSocketRequest(daemon.runtime.socketPort!, { command: 'session_list' }),
+    ).rejects.toThrow();
+    expect(fs.existsSync(paths.infoPath)).toBe(true);
+    expect(await daemon.shutdown()).toEqual({ ok: true, data: { outcome: 'draining' } });
+
+    releaseTeardown();
+    expect(await daemon.exit).toBe(0);
+    expect(fs.existsSync(paths.infoPath)).toBe(false);
+    await expect(
+      sendControlCommand(daemon.runtime.controlPort!, {
+        token: daemon.runtime.token,
+        fence: {
+          pid: daemon.runtime.identity.pid,
+          processStartTime: daemon.runtime.identity.startTime,
+        },
+        command: DAEMON_SHUTDOWN_COMMAND,
+        requestId: 'after-exit',
+      }),
+    ).rejects.toThrow();
+  } finally {
+    releaseTeardown();
     await daemon.runtime.close();
   }
 });

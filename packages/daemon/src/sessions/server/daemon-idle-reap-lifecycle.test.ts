@@ -3,6 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 import {
+  DAEMON_QUIESCE_COMMAND,
+  DAEMON_SHUTDOWN_COMMAND,
+} from '@agent-device/daemon-contracts/daemon-control';
+import {
   buildDaemonLifecycleRequest,
   type DaemonRuntimeOwnership,
 } from '@agent-device/daemon-contracts/daemon-resolution';
@@ -33,6 +37,7 @@ afterEach(() => {
 
 type Seam = {
   admit: (handler: Handler) => (request: DaemonRequest) => Promise<DaemonResponse>;
+  control: ReturnType<typeof createDaemonLifecycleAdmission>['control'];
   drained: ReturnType<typeof vi.fn>;
   served: MockHandler;
 };
@@ -60,6 +65,7 @@ function makeSeam(
   });
   return {
     admit: admission.admit,
+    control: admission.control,
     drained,
     served: vi.fn(async () => ({ ok: true })) as MockHandler,
   };
@@ -224,4 +230,30 @@ test('invalid ordinary requests never enter the admitted handler, including whil
   const response = await handle({ ...ordinaryRequest(), token: 'wrong' });
   assert.equal(!response.ok && response.error.code, 'UNAUTHORIZED');
   assert.equal(served.mock.calls.length, 0);
+});
+
+test('tenant admission refuses daemon_shutdown while control runs shutdown and quiesce', async () => {
+  openOneSession();
+  const { admit, control, drained, served } = makeSeam({ ownership: 'detached' });
+  const tenantShutdown = await admit(served)({
+    ...buildDaemonLifecycleRequest({ token: TOKEN, fence: FENCE, requestId: 'tenant-shutdown' }),
+    command: DAEMON_SHUTDOWN_COMMAND,
+  });
+  assert.equal(!tenantShutdown.ok && tenantShutdown.error.code, 'UNAUTHORIZED');
+  assert.equal(drained.mock.calls.length, 0);
+
+  const busyQuiesce = control(DAEMON_QUIESCE_COMMAND, FENCE);
+  assert.equal(reasonOf(busyQuiesce), 'daemon-busy');
+  assert.equal(drained.mock.calls.length, 0);
+
+  assert.deepEqual(control(DAEMON_SHUTDOWN_COMMAND, FENCE), {
+    ok: true,
+    data: { outcome: 'draining' },
+  });
+  assert.deepEqual(control(DAEMON_SHUTDOWN_COMMAND, FENCE), {
+    ok: true,
+    data: { outcome: 'draining' },
+  });
+  await settled();
+  assert.equal(drained.mock.calls.length, 1);
 });

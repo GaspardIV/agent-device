@@ -134,6 +134,7 @@ export type DaemonRuntimeController = {
   identity: Readonly<OwnerIdentity>;
   httpPort?: number;
   socketPort?: number;
+  controlPort?: number;
   /**
    * Closes the runtime. Concurrent and repeated calls share one close, whose report every caller
    * receives. The runtime never exits the process: the executable owns signals and exit codes.
@@ -519,10 +520,15 @@ async function startDaemonRuntimeOnHost(
     }
   });
 
-  const publishDaemonInfo = (socketPort: number | undefined, httpPort: number | undefined) => {
+  const publishDaemonInfo = (
+    socketPort: number | undefined,
+    httpPort: number | undefined,
+    controlPort: number | undefined,
+  ) => {
     registration.publish({
       socketPort,
       httpPort,
+      controlPort,
       token,
       version,
       codeOrigin: codeIdentity.origin,
@@ -629,7 +635,7 @@ async function startDaemonRuntimeOnHost(
   recordStartupPhase('recovery-finished');
   const { openDaemonServers, reconcileDeviceClaimsForDaemonStartup } =
     await import('./server-startup.ts');
-  const { servers, socketPort, httpPort } = await openDaemonServers(
+  const { servers, controlServer, socketPort, httpPort, controlPort } = await openDaemonServers(
     daemonServerMode,
     {
       handleRequest,
@@ -665,9 +671,14 @@ async function startDaemonRuntimeOnHost(
             ),
     },
     rollback,
+    {
+      token,
+      identity: { pid: daemonIdentity.pid, processStartTime: daemonIdentity.startTime },
+      handleControl: lifecycleAdmission.control,
+    },
   );
   recordStartupPhase('listening');
-  publishDaemonInfo(socketPort, httpPort);
+  publishDaemonInfo(socketPort, httpPort, controlPort);
   recordStartupPhase('registered');
   removeDaemonStartupPhasesFile(startupPhasesPath);
   stopMetadataLossWatch = armDaemonMetadataLossWatch(baseDir, infoPath, logPath, daemonIdentity);
@@ -876,6 +887,12 @@ async function startDaemonRuntimeOnHost(
           },
         }),
       ]);
+      // Close the authenticated control channel only after `daemon.json` is retired so the port
+      // cannot be rebound while local stop still discovers it, and a second stop during drain
+      // still sees `{ outcome: 'draining' }`.
+      if (controlServer) {
+        await Promise.allSettled([closeDaemonServers([controlServer], 500)]);
+      }
       if (!hasUnfinishedWork()) {
         try {
           await deps.ownerLifecycle.clearDaemonLockConfiguration();
@@ -912,6 +929,7 @@ async function startDaemonRuntimeOnHost(
 
   return {
     httpPort,
+    controlPort,
     close,
     closed,
     run: runtimeState.run,

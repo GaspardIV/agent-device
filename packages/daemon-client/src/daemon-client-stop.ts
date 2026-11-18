@@ -18,11 +18,13 @@ import { parseDaemonInfo } from './daemon-client-metadata.ts';
 export async function stopRecordedDaemon(
   record: DaemonStopIdentity,
   target: DaemonLifecycleTarget,
+  options?: { shutdownTimeoutMs?: number },
 ): Promise<DaemonStopResult> {
   if (record.ownership === 'unreadable') throw daemonRecordUnreadableError(target.paths);
   const gracefulShutdown = createGracefulDaemonShutdown(
     record.record ? parseDaemonInfo(record.record) : null,
     target,
+    options?.shutdownTimeoutMs !== undefined ? { timeoutMs: options.shutdownTimeoutMs } : undefined,
   );
   const stopped = await stopDaemon({
     paths: target.paths,

@@ -53,6 +53,7 @@ export const DAEMON_STARTUP_EXIT_CODES = Object.freeze({ busy: 75, unproven: 78 
 export type DaemonRegistrationFields = Readonly<{
   socketPort?: number;
   httpPort?: number;
+  controlPort?: number;
   token: string;
   version: string;
   codeOrigin: DaemonCodeOrigin;

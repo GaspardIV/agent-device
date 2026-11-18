@@ -1,20 +1,43 @@
+import net from 'node:net';
+import {
+  DAEMON_CONTROL_MAX_LINE_BYTES,
+  DAEMON_CONTROL_PROTOCOL_VERSION,
+  DAEMON_QUIESCE_COMMAND,
+  DAEMON_SHUTDOWN_COMMAND,
+  createDaemonControlNonce,
+  parseControlChallengeResponse,
+  parseControlCommandResponse,
+  signDaemonControlCommand,
+  verifyDaemonControlChallenge,
+  verifyDaemonControlReply,
+  type DaemonControlCommand,
+  type DaemonControlCommandRequest,
+} from '@agent-device/daemon-contracts/daemon-control';
+import { readRegisteredDaemonOwnership } from '@agent-device/daemon-contracts/daemon-registration';
 import {
   DAEMON_LIFECYCLE_REASONS,
   DAEMON_SHUTTING_DOWN_REASON,
   buildDaemonLifecycleRequest,
-  buildDaemonShutdownRequest,
   readDaemonLifecycleCensus,
+  type DaemonLifecycleFence,
   type DaemonPaths,
 } from '@agent-device/daemon-contracts/daemon-resolution';
 import type {
   DaemonGracefulShutdown,
   DaemonProcessIdentity,
 } from '@agent-device/daemon-contracts/daemon-process';
-import type { DaemonWireRequest } from '@agent-device/contracts/command';
-import type { HostEnvironment } from '@agent-device/kernel/source-value';
+import { readDaemonShutdownReport } from '@agent-device/daemon-contracts/daemon-shutdown-report';
 import { createRequestId } from '@agent-device/host-kit/diagnostics';
 import { sleep } from '@agent-device/host-kit/retry';
-import { AppError, throwDaemonError, type NormalizedError } from '@agent-device/kernel/errors';
+import { consumeTextLines } from '@agent-device/host-kit/transport';
+import {
+  AppError,
+  throwDaemonError,
+  toAppErrorCode,
+  type NormalizedError,
+} from '@agent-device/kernel/errors';
+import { isRecord } from '@agent-device/kernel/record';
+import type { HostEnvironment } from '@agent-device/kernel/source-value';
 import type { DaemonInfo } from './daemon-client-metadata.ts';
 import { isDaemonTransportUnavailableError, sendRequest } from './daemon-client-transport.ts';
 import { daemonBusyError, daemonNotRetirableError } from './daemon-lifecycle-errors.ts';
@@ -39,33 +62,42 @@ function isConnectionFailure(error: unknown): boolean {
   return error instanceof AppError && error.details?.reason === 'daemon_transport_failure';
 }
 
-function isTransportTimeoutFailure(error: unknown): boolean {
-  return error instanceof AppError && error.details?.reason === 'daemon_transport_timeout';
-}
-
 type DaemonLifecycleOutcome = Readonly<{ outcome: 'draining' | 'gone' }>;
 
 /** A daemon's refusal, as read from either transport's shape of it. */
 type RefusedDaemonAnswer = Readonly<{ reason: unknown; details: unknown }>;
 
-type ControlRequestSendResult =
+type AuthenticatedControlResult =
   | Readonly<{ kind: 'ok'; data: unknown }>
   | Readonly<{ kind: 'gone' }>
-  | Readonly<{ kind: 'timeout'; error: unknown }>
+  | Readonly<{ kind: 'unauthenticated' }>
+  | Readonly<{ kind: 'timeout'; commandSent: boolean }>
+  | Readonly<{
+      kind: 'post-dispatch-uncertain';
+      reason: 'transport' | 'malformed';
+    }>
   | Readonly<{
       kind: 'refused';
       refusal: RefusedDaemonAnswer;
-      normalizedError?: NormalizedError;
-      caughtError?: unknown;
+      normalizedError: NormalizedError;
     }>;
 
-async function sendControlRequest(
+/** Asks the fenced detached daemon to leave if idle, without timeout recovery. */
+export async function requestDaemonLifecycle(
   info: DaemonInfo,
-  request: DaemonWireRequest,
   target: DaemonLifecycleTarget,
-  timeoutMs: number,
-  readThrownRefusal: (error: unknown) => RefusedDaemonAnswer | undefined = readOwnerRefusal,
-): Promise<ControlRequestSendResult> {
+  options?: { timeoutMs?: number },
+): Promise<DaemonLifecycleOutcome> {
+  const timeoutMs = options?.timeoutMs ?? LIFECYCLE_REQUEST_TIMEOUT_MS;
+  if (typeof info.controlPort === 'number') {
+    const result = await sendAuthenticatedControlCommand(info, DAEMON_QUIESCE_COMMAND, timeoutMs);
+    return handleAuthenticatedQuiesceResult(result, info, target);
+  }
+  const request = buildDaemonLifecycleRequest({
+    token: info.token,
+    fence: { pid: info.pid, processStartTime: info.processStartTime ?? null },
+    requestId: createRequestId(),
+  });
   let response;
   try {
     response = await sendRequest(
@@ -80,47 +112,50 @@ async function sendControlRequest(
     );
   } catch (error) {
     if (isDaemonTransportUnavailableError(error) || isConnectionFailure(error)) {
-      return { kind: 'gone' };
+      return { outcome: 'gone' };
     }
-    if (isTransportTimeoutFailure(error)) return { kind: 'timeout', error };
-    // HTTP carries RPC/ownership refusals as thrown AppErrors rather than response envelopes.
-    const refusal = readThrownRefusal(error);
-    if (refusal) return { kind: 'refused', refusal, caughtError: error };
+    // HTTP carries the ownership refusal as an error rather than a response.
+    const refusal = readOwnerRefusal(error);
+    const judged = refusal && judgeRefusedAnswer(refusal, info, target);
+    if (judged) return judged;
     throw error;
   }
-  if (response.ok) return { kind: 'ok', data: response.data };
+  if (response.ok) return { outcome: 'draining' };
   const details = response.error.details;
-  return {
-    kind: 'refused',
-    refusal: { reason: details?.reason, details },
-    normalizedError: response.error,
-  };
+  const judged = judgeRefusedAnswer({ reason: details?.reason, details }, info, target);
+  if (judged) return judged;
+  throwDaemonError(response.error);
 }
 
-/** Asks the fenced detached daemon to leave if idle, without timeout recovery. */
-export async function requestDaemonLifecycle(
+function handleAuthenticatedQuiesceResult(
+  result: AuthenticatedControlResult,
   info: DaemonInfo,
   target: DaemonLifecycleTarget,
-): Promise<DaemonLifecycleOutcome> {
-  const request = buildDaemonLifecycleRequest({
-    token: info.token,
-    fence: { pid: info.pid, processStartTime: info.processStartTime ?? null },
-    requestId: createRequestId(),
-  });
-  const result = await sendControlRequest(info, request, target, LIFECYCLE_REQUEST_TIMEOUT_MS);
-  if (result.kind === 'gone') return { outcome: 'gone' };
+): DaemonLifecycleOutcome {
   if (result.kind === 'ok') return { outcome: 'draining' };
-  if (result.kind === 'timeout') throw result.error;
+  if (result.kind === 'gone' || result.kind === 'unauthenticated') return { outcome: 'gone' };
+  if (result.kind === 'timeout') {
+    throw new AppError('COMMAND_FAILED', 'Daemon lifecycle request timed out', {
+      reason: 'daemon_transport_timeout',
+    });
+  }
+  if (result.kind === 'post-dispatch-uncertain') {
+    if (result.reason === 'malformed') {
+      throw new AppError('COMMAND_FAILED', 'Invalid daemon response', {
+        reason: 'daemon_response_invalid',
+      });
+    }
+    return { outcome: 'gone' };
+  }
   const judged = judgeRefusedAnswer(result.refusal, info, target);
   if (judged) return judged;
-  if (result.normalizedError) throwDaemonError(result.normalizedError);
-  throw result.caughtError;
+  throwDaemonError(result.normalizedError);
 }
 
 /**
- * Asks a fenced detached daemon to shut down gracefully over IPC/HTTP without waiting for
- * idle-only admission. Returns `undefined` when `info` predates `shutdown`, has a
- * non-detached owner, or lacks an endpoint/token.
+ * Asks a fenced detached daemon to shut down gracefully over the authenticated local control
+ * channel without waiting for idle-only admission. Returns `undefined` when `info` predates
+ * `shutdown`, has a non-detached owner, or lacks a local control port/token.
  */
 export function createGracefulDaemonShutdown(
   info: DaemonInfo | null | undefined,
@@ -129,7 +164,7 @@ export function createGracefulDaemonShutdown(
 ): DaemonGracefulShutdown | undefined {
   if (!info || (info.ownership && info.ownership !== 'detached')) return undefined;
   if (!info.capabilities?.includes('shutdown')) return undefined;
-  if (!info.token || (info.port === undefined && info.httpPort === undefined)) return undefined;
+  if (!info.token || typeof info.controlPort !== 'number') return undefined;
   const timeoutMs = options?.timeoutMs ?? SHUTDOWN_REQUEST_TIMEOUT_MS;
   return async (identity) => {
     const fencedInfo = fenceDaemonInfo(info, identity);
@@ -156,23 +191,18 @@ async function requestDaemonShutdownAttempt(
   target: DaemonLifecycleTarget,
   timeoutMs: number,
 ): Promise<ShutdownAttemptOutcome> {
-  const request = buildDaemonShutdownRequest({
-    token: fencedInfo.token,
-    fence: { pid: fencedInfo.pid, processStartTime: fencedInfo.processStartTime ?? null },
-    requestId: createRequestId(),
-  });
-  const result = await sendControlRequest(
+  const result = await sendAuthenticatedControlCommand(
     fencedInfo,
-    request,
-    target,
+    DAEMON_SHUTDOWN_COMMAND,
     timeoutMs,
-    readAppErrorRefusal,
   );
   if (result.kind === 'ok') return isDrainingOutcome(result.data) ? 'accepted' : 'unavailable';
-  // A slow daemon may already have accepted shutdown past the RPC timeout; let the caller wait
-  // its drain grace window before escalating to OS signals.
-  if (result.kind === 'timeout') return 'accepted';
-  if (result.kind === 'gone') return 'unavailable';
+  // Once the daemon proved its identity and received the command, a reset, truncated reply, or
+  // read timeout can mean it began draining; wait the drain grace window before escalating.
+  if (result.kind === 'timeout') return result.commandSent ? 'accepted' : 'unavailable';
+  if (result.kind === 'post-dispatch-uncertain') return 'accepted';
+  if (result.kind === 'unauthenticated') return 'unavailable';
+  if (result.kind === 'gone') return judgeGoneShutdown(fencedInfo, target);
   const { reason, details } = result.refusal;
   if (reason === DAEMON_SHUTTING_DOWN_REASON) return 'accepted';
   if (reason === DAEMON_LIFECYCLE_REASONS.ownerEmbedded) return 'embedded-owner';
@@ -182,26 +212,219 @@ async function requestDaemonShutdownAttempt(
   return 'unavailable';
 }
 
+function judgeGoneShutdown(
+  fencedInfo: DaemonInfo,
+  target: DaemonLifecycleTarget,
+): ShutdownAttemptOutcome {
+  const ownership = readRegisteredDaemonOwnership(target.paths.infoPath, {
+    pid: fencedInfo.pid,
+    startTime: fencedInfo.processStartTime ?? null,
+  });
+  // `controlServer` stays open until after `finishDaemonRegistration` retires `daemon.json` and
+  // writes `daemon-shutdown.json`. Only a retired registration paired with that report proves a
+  // completed drain; if `daemon.json` still matches or disappeared without a report, do not stall.
+  if (ownership.state === 'absent' && readDaemonShutdownReport(target.paths.baseDir) !== null) {
+    return 'accepted';
+  }
+  return 'unavailable';
+}
+
+async function sendAuthenticatedControlCommand(
+  info: DaemonInfo,
+  command: DaemonControlCommand,
+  timeoutMs: number,
+): Promise<AuthenticatedControlResult> {
+  const controlPort = info.controlPort;
+  if (typeof controlPort !== 'number') return { kind: 'gone' };
+  const fence: DaemonLifecycleFence = {
+    pid: info.pid,
+    processStartTime: info.processStartTime ?? null,
+  };
+  const clientNonce = createDaemonControlNonce();
+  const requestId = createRequestId();
+
+  return await new Promise<AuthenticatedControlResult>((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port: controlPort });
+    let settled = false;
+    let connected = false;
+    let commandSent = false;
+    let serverNonce: string | null = null;
+    let buffer = '';
+
+    const finish = (result: AuthenticatedControlResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutHandle);
+      socket.destroy();
+      resolve(result);
+    };
+
+    const timeoutHandle = setTimeout(() => {
+      finish({ kind: 'timeout', commandSent });
+    }, timeoutMs);
+
+    const failureBeforeSettle = (reason: 'transport' | 'malformed'): AuthenticatedControlResult => {
+      if (commandSent) return { kind: 'post-dispatch-uncertain', reason };
+      return connected ? { kind: 'unauthenticated' } : { kind: 'gone' };
+    };
+
+    socket.setEncoding('utf8');
+    socket.once('connect', () => {
+      connected = true;
+      if (settled || socket.destroyed) return;
+      socket.write(
+        `${JSON.stringify({
+          type: 'challenge',
+          version: DAEMON_CONTROL_PROTOCOL_VERSION,
+          nonce: clientNonce,
+          requestId,
+        })}\n`,
+      );
+    });
+
+    const handleLine = (line: string): void => {
+      if (serverNonce === null) {
+        const challenge = parseControlChallengeResponse(line);
+        if (
+          !challenge ||
+          !verifyDaemonControlChallenge({
+            token: info.token,
+            fence,
+            clientNonce,
+            serverNonce: challenge.serverNonce,
+            proof: challenge.proof,
+          })
+        ) {
+          finish({ kind: 'unauthenticated' });
+          return;
+        }
+        if (settled || socket.destroyed) {
+          finish({ kind: 'unauthenticated' });
+          return;
+        }
+        serverNonce = challenge.serverNonce;
+        const frame: DaemonControlCommandRequest = {
+          type: 'command',
+          version: DAEMON_CONTROL_PROTOCOL_VERSION,
+          command,
+          clientNonce,
+          serverNonce,
+          pid: fence.pid,
+          processStartTime: fence.processStartTime,
+          requestId,
+          proof: signDaemonControlCommand({
+            token: info.token,
+            command,
+            fence,
+            clientNonce,
+            serverNonce,
+            requestId,
+          }),
+        };
+        commandSent = true;
+        socket.write(`${JSON.stringify(frame)}\n`);
+        return;
+      }
+      const reply = parseControlCommandResponse(line);
+      if (
+        !reply ||
+        !verifyDaemonControlReply({
+          token: info.token,
+          fence,
+          clientNonce,
+          serverNonce,
+          requestId,
+          payload: reply.payload,
+          proof: reply.proof,
+        })
+      ) {
+        finish({ kind: 'post-dispatch-uncertain', reason: 'malformed' });
+        return;
+      }
+      finish(parseControlPayloadResult(reply.payload));
+    };
+
+    socket.on('data', (chunk: string) => {
+      if (settled) return;
+      if (
+        Buffer.byteLength(buffer, 'utf8') + Buffer.byteLength(chunk, 'utf8') >
+        DAEMON_CONTROL_MAX_LINE_BYTES
+      ) {
+        finish(failureBeforeSettle('malformed'));
+        return;
+      }
+      const next = consumeTextLines(buffer, chunk);
+      buffer = next.buffer;
+      for (const line of next.lines) {
+        if (settled) return;
+        handleLine(line);
+      }
+    });
+
+    socket.on('end', () => {
+      if (settled) return;
+      finish(failureBeforeSettle(buffer.trim() ? 'malformed' : 'transport'));
+    });
+
+    socket.on('error', () => {
+      if (settled) return;
+      finish(failureBeforeSettle('transport'));
+    });
+
+    socket.on('close', () => {
+      if (settled) return;
+      finish(failureBeforeSettle('transport'));
+    });
+  });
+}
+
+function parseControlPayloadResult(payload: string): AuthenticatedControlResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return { kind: 'post-dispatch-uncertain', reason: 'malformed' };
+  }
+  if (!isRecord(parsed) || typeof parsed.ok !== 'boolean') {
+    return { kind: 'post-dispatch-uncertain', reason: 'malformed' };
+  }
+  if (parsed.ok) return { kind: 'ok', data: parsed.data };
+  if (!isRecord(parsed.error)) {
+    return { kind: 'post-dispatch-uncertain', reason: 'malformed' };
+  }
+  const details = isRecord(parsed.error.details) ? parsed.error.details : undefined;
+  const normalizedError: NormalizedError = {
+    code: toAppErrorCode(
+      typeof parsed.error.code === 'string' ? parsed.error.code : undefined,
+      'COMMAND_FAILED',
+    ),
+    message:
+      typeof parsed.error.message === 'string'
+        ? parsed.error.message
+        : 'Daemon control request failed.',
+    ...(details ? { details } : {}),
+  };
+  return {
+    kind: 'refused',
+    refusal: { reason: details?.reason, details },
+    normalizedError,
+  };
+}
+
 function isDrainingOutcome(data: unknown): boolean {
-  return (
-    typeof data === 'object' &&
-    data !== null &&
-    (data as Record<string, unknown>).outcome === 'draining'
-  );
+  return isRecord(data) && data.outcome === 'draining';
 }
 
 function isStartingUpCensus(details: unknown): boolean {
   return readDaemonLifecycleCensus(details)?.startingUp === true;
 }
 
-function readAppErrorRefusal(error: unknown): RefusedDaemonAnswer | undefined {
-  if (!(error instanceof AppError)) return undefined;
-  return { reason: error.details?.reason, details: error.details };
-}
-
 function readOwnerRefusal(error: unknown): RefusedDaemonAnswer | undefined {
-  const refusal = readAppErrorRefusal(error);
-  return refusal?.reason === DAEMON_LIFECYCLE_REASONS.ownerEmbedded ? refusal : undefined;
+  if (!(error instanceof AppError)) return undefined;
+  const reason = error.details?.reason;
+  return reason === DAEMON_LIFECYCLE_REASONS.ownerEmbedded
+    ? { reason, details: error.details }
+    : undefined;
 }
 
 function judgeRefusedAnswer(

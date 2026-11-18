@@ -1,4 +1,5 @@
 import type { HostEnvironment } from '@agent-device/kernel/source-value';
+import { isRecord } from '@agent-device/kernel/record';
 import type { DaemonWireRequest } from '@agent-device/contracts/command';
 import type { DaemonResponse } from '@agent-device/kernel/contracts';
 import {
@@ -35,10 +36,23 @@ export function handleDaemonHttpResponseBody(
   try {
     const parsed = parseDaemonHttpResponseBody(body);
     if (parsed.error) {
-      void rejectDaemonHttpRpcError(parsed.error, { info, req, stateDir, reject });
+      void rejectDaemonHttpRpcError(parsed.error, { info, req, stateDir, reject }).catch((err) => {
+        reject(
+          new AppError(
+            'COMMAND_FAILED',
+            'Invalid daemon response',
+            {
+              requestId: req.meta?.requestId,
+              reason: 'daemon_response_invalid',
+              line: body,
+            },
+            err instanceof Error ? err : undefined,
+          ),
+        );
+      });
       return;
     }
-    if (!parsed.result || typeof parsed.result !== 'object') {
+    if (!isRecord(parsed.result) || typeof parsed.result.ok !== 'boolean') {
       reject(
         new AppError('COMMAND_FAILED', 'Invalid daemon RPC response', {
           requestId: req.meta?.requestId,
@@ -47,7 +61,16 @@ export function handleDaemonHttpResponseBody(
       );
       return;
     }
-    void resolveDaemonHttpResult(info, req, parsed.result, { host, stateDir }, resolve, reject);
+    void resolveDaemonHttpResult(
+      info,
+      req,
+      parsed.result,
+      { host, stateDir },
+      resolve,
+      reject,
+    ).catch((err) => {
+      reject(err);
+    });
   } catch (err) {
     reject(
       new AppError(
@@ -68,10 +91,47 @@ function parseDaemonHttpResponseBody(body: string): {
   result?: DaemonResponse;
   error?: { message?: string; data?: Record<string, unknown> };
 } {
-  return JSON.parse(body) as {
+  const parsed: unknown = JSON.parse(body);
+  if (!isRecord(parsed)) {
+    throw new Error('Daemon RPC response body must be a JSON object');
+  }
+  const envelope = parsed as {
     result?: DaemonResponse;
     error?: { message?: string; data?: Record<string, unknown> };
   };
+  const rpcError: unknown = parsed.error;
+  if (rpcError === undefined || rpcError === null) return envelope;
+  if (!isRecord(rpcError)) {
+    throw new Error('Daemon RPC error envelope must be a JSON object');
+  }
+  if (rpcError.message !== undefined && typeof rpcError.message !== 'string') {
+    throw new Error('Daemon RPC error message must be a string');
+  }
+  if (rpcError.data === undefined) return envelope;
+  if (!isRecord(rpcError.data)) {
+    throw new Error('Daemon RPC error data must be a JSON object');
+  }
+  const data = rpcError.data;
+  const fieldTypes: readonly [string, 'string' | 'record' | 'boolean'][] = [
+    ['code', 'string'],
+    ['message', 'string'],
+    ['hint', 'string'],
+    ['diagnosticId', 'string'],
+    ['logPath', 'string'],
+    ['supportedOn', 'string'],
+    ['details', 'record'],
+    ['diagnosticsRecord', 'record'],
+    ['retriable', 'boolean'],
+  ];
+  for (const [key, expectedType] of fieldTypes) {
+    const value = data[key];
+    if (value === undefined) continue;
+    const valid = expectedType === 'record' ? isRecord(value) : typeof value === expectedType;
+    if (!valid) {
+      throw new Error(`Daemon RPC error data.${key} must be a ${expectedType}`);
+    }
+  }
+  return envelope;
 }
 
 /**
@@ -91,27 +151,41 @@ async function rejectDaemonHttpRpcError(
 ): Promise<void> {
   const { info, req, stateDir, reject } = options;
   const requestId = req.meta?.requestId;
-  const payload = toDaemonHttpRpcError(error);
-  if (!info.baseUrl) {
-    reject(appErrorFromDaemonError(payload, requestId));
-    return;
-  }
-  const localized = await localizeRemoteDaemonError(payload, {
-    endpoint: {
-      baseUrl: info.baseUrl,
-      token: info.token,
-      tenantId: req.meta?.tenantId,
-      leaseId: leaseScopeFromRequest(req).leaseId,
-    },
-    stateDir,
-    requestId,
-  });
-  reject(
-    appErrorFromDaemonError(
-      await settleFailedDeliveryReceipt(info, req, stateDir, localized),
+  try {
+    const payload = toDaemonHttpRpcError(error);
+    if (!info.baseUrl) {
+      reject(appErrorFromDaemonError(payload, requestId));
+      return;
+    }
+    const localized = await localizeRemoteDaemonError(payload, {
+      endpoint: {
+        baseUrl: info.baseUrl,
+        token: info.token,
+        tenantId: req.meta?.tenantId,
+        leaseId: leaseScopeFromRequest(req).leaseId,
+      },
+      stateDir,
       requestId,
-    ),
-  );
+    });
+    reject(
+      appErrorFromDaemonError(
+        await settleFailedDeliveryReceipt(info, req, stateDir, localized),
+        requestId,
+      ),
+    );
+  } catch (err) {
+    reject(
+      new AppError(
+        'COMMAND_FAILED',
+        'Invalid daemon response',
+        {
+          requestId,
+          reason: 'daemon_response_invalid',
+        },
+        err instanceof Error ? err : undefined,
+      ),
+    );
+  }
 }
 
 /**
@@ -143,16 +217,18 @@ function toDaemonHttpRpcError(error: {
   message?: string;
   data?: Record<string, unknown>;
 }): DaemonError {
-  const data = error.data ?? {};
+  const data = isRecord(error.data) ? error.data : {};
   const cause = readDaemonErrorCause(data.cause);
   return {
-    code: toAppErrorCode(data.code != null ? String(data.code) : undefined, 'COMMAND_FAILED'),
-    message: String(data.message ?? error.message ?? 'Daemon RPC request failed'),
+    code: toAppErrorCode(typeof data.code === 'string' ? data.code : undefined, 'COMMAND_FAILED'),
+    message:
+      typeof data.message === 'string'
+        ? data.message
+        : typeof error.message === 'string'
+          ? error.message
+          : 'Daemon RPC request failed',
     cause,
-    details:
-      typeof data.details === 'object' && data.details
-        ? (data.details as Record<string, unknown>)
-        : undefined,
+    details: isRecord(data.details) ? data.details : undefined,
     hint: typeof data.hint === 'string' ? data.hint : undefined,
     diagnosticId: typeof data.diagnosticId === 'string' ? data.diagnosticId : undefined,
     logPath: typeof data.logPath === 'string' ? data.logPath : undefined,
