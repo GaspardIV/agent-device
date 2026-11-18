@@ -16,7 +16,7 @@ import {
 import { readDaemonStopIdentity } from '@agent-device/daemon-contracts/daemon-registration';
 import { resolveDaemonShutdownReportPath } from '@agent-device/daemon-contracts/daemon-shutdown-report';
 import { readDaemonInfo } from '../daemon-client-metadata.ts';
-import { stopDaemonForTakeover } from '../daemon-client-startup.ts';
+import { readReusableLocalDaemon, stopDaemonForTakeover } from '../daemon-client-startup.ts';
 import { stopRecordedDaemon } from '../daemon-client-stop.ts';
 import * as transport from '../daemon-client-transport.ts';
 
@@ -154,7 +154,7 @@ async function withMockStopDaemon(
   transportKind: 'socket' | 'http',
   buildScript: (ctx: { infoPath: string; reportPath: string }) => string,
   run: (ctx: { paths: DaemonPaths; daemon: ChildProcess; record: string }) => Promise<void>,
-  options?: { capabilities?: readonly DaemonCapability[] },
+  options?: { capabilities?: readonly DaemonCapability[]; version?: string },
 ): Promise<void> {
   const baseDir = mkdtempForTestSync(prefix);
   const paths = resolveDaemonPaths(baseDir);
@@ -178,6 +178,7 @@ async function withMockStopDaemon(
     const record = JSON.stringify({
       pid: daemon.pid,
       processStartTime,
+      ...(options?.version ? { version: options.version } : {}),
       ownership: 'detached',
       ...(transportKind === 'http' ? { httpPort: port } : { port }),
       transport: transportKind,
@@ -549,5 +550,52 @@ setInterval(() => {}, 1000);`,
         expect(retirement.termination.mode).toBe('forced');
       }
     },
+  );
+});
+
+test('readReusableLocalDaemon retires an incompatible-version daemon over RPC without signalling', async () => {
+  await withMockStopDaemon(
+    'agent-device-reusable-takeover-rpc-',
+    'http',
+    ({ infoPath }) => `import fs from 'node:fs';
+import http from 'node:http';
+const infoPath = ${JSON.stringify(infoPath)};
+const server = http.createServer((req, res) => {
+  let body = '';
+  req.setEncoding('utf8');
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    const rpc = JSON.parse(body);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({ jsonrpc: '2.0', id: rpc.id ?? null, result: { ok: true, data: { outcome: 'draining' } } }),
+      () => {
+        fs.rmSync(infoPath, { force: true });
+        server.close(() => process.exit(0));
+      },
+    );
+  });
+});
+server.listen(0, '127.0.0.1', () => {
+  console.log(JSON.stringify({ port: server.address().port, token: 'reusable-token' }));
+});`,
+    async ({ paths, daemon }) => {
+      const signals = vi.spyOn(process, 'kill');
+      const exited = once(daemon, 'exit');
+      const reusable = await readReusableLocalDaemon({
+        host: createTestHostEnvironment(),
+        paths,
+        daemonLifecycle: 'managed',
+        retireIncompatibleContender: true,
+        transportPreference: 'auto',
+        serverMode: 'http',
+      });
+      const [exitCode] = await exited;
+
+      expect(reusable).toBeNull();
+      expect(exitCode).toBe(0);
+      expect(signals.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([]);
+    },
+    { version: '0.0.0' },
   );
 });

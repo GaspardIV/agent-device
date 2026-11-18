@@ -143,7 +143,12 @@ export async function readReusableLocalDaemon(
 
   if (remainingStartupBudget(deadline) < MINIMUM_DAEMON_TAKEOVER_BUDGET_MS) return null;
   emitDaemonTakeoverNotice(existing, decision.reason, settings.paths.baseDir);
-  await retireDaemonForTakeover(existing, settings.paths, 'graceful', settings.host);
+  await retireDaemonForTakeover(
+    existing,
+    settings.paths,
+    'graceful',
+    decision.cause === 'unreachable' ? undefined : settings.host,
+  );
   return null;
 }
 
@@ -164,9 +169,10 @@ export async function stopDaemonForTakeover(
 ): Promise<DaemonRetirementResult> {
   // Optional `host` preserves callers like unreachable-daemon replacement (`replaceUnreachable`, already
   // known non-responsive on probes) and existing tests without firing RPCs or breaking R86 process-global rules.
-  const gracefulShutdown = host
-    ? createGracefulDaemonShutdown(existing, { paths, host }, { mode })
-    : undefined;
+  const gracefulShutdown =
+    host && mode === 'graceful'
+      ? createGracefulDaemonShutdown(existing, { paths, host })
+      : undefined;
   return await stopAndRetireDaemon({
     paths: paths,
     observed: observedDaemonIdentityOf(existing),

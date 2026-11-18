@@ -6,7 +6,10 @@ import {
   readDaemonLifecycleCensus,
   type DaemonPaths,
 } from '@agent-device/daemon-contracts/daemon-resolution';
-import type { DaemonGracefulShutdown } from '@agent-device/daemon-contracts/daemon-process';
+import type {
+  DaemonGracefulShutdown,
+  DaemonProcessIdentity,
+} from '@agent-device/daemon-contracts/daemon-process';
 import type { DaemonWireRequest } from '@agent-device/contracts/command';
 import type { HostEnvironment } from '@agent-device/kernel/source-value';
 import { createRequestId } from '@agent-device/host-kit/diagnostics';
@@ -116,56 +119,67 @@ export async function requestDaemonLifecycle(
 
 /**
  * Asks a fenced detached daemon to shut down gracefully over IPC/HTTP without waiting for
- * idle-only admission. Returns `undefined` when `mode === 'force'`, `info` predates `shutdown`,
- * has a non-detached owner, or lacks an endpoint/token.
+ * idle-only admission. Returns `undefined` when `info` predates `shutdown`, has a
+ * non-detached owner, or lacks an endpoint/token.
  */
 export function createGracefulDaemonShutdown(
   info: DaemonInfo | null | undefined,
   target: DaemonLifecycleTarget,
-  options?: { mode?: 'graceful' | 'force'; timeoutMs?: number },
+  options?: { timeoutMs?: number },
 ): DaemonGracefulShutdown | undefined {
-  if (options?.mode === 'force') return undefined;
   if (!info || (info.ownership && info.ownership !== 'detached')) return undefined;
   if (!info.capabilities?.includes('shutdown')) return undefined;
   if (!info.token || (info.port === undefined && info.httpPort === undefined)) return undefined;
+  const timeoutMs = options?.timeoutMs ?? SHUTDOWN_REQUEST_TIMEOUT_MS;
   return async (identity) => {
-    const fencedInfo =
-      info.pid === identity.pid && info.processStartTime === identity.startTime
-        ? info
-        : { ...info, pid: identity.pid, processStartTime: identity.startTime ?? undefined };
-    const timeoutMs = options?.timeoutMs ?? SHUTDOWN_REQUEST_TIMEOUT_MS;
+    const fencedInfo = fenceDaemonInfo(info, identity);
     const deadline = Date.now() + SHUTDOWN_STARTUP_RETRY_BUDGET_MS;
     for (;;) {
-      const request = buildDaemonShutdownRequest({
-        token: fencedInfo.token,
-        fence: { pid: fencedInfo.pid, processStartTime: fencedInfo.processStartTime ?? null },
-        requestId: createRequestId(),
-      });
-      const result = await sendControlRequest(
-        fencedInfo,
-        request,
-        target,
-        timeoutMs,
-        readAppErrorRefusal,
-      );
-      if (result.kind === 'ok') return isDrainingOutcome(result.data) ? 'accepted' : 'unavailable';
-      // A slow daemon may already have accepted shutdown past the RPC timeout; let the caller wait
-      // its drain grace window before escalating to OS signals.
-      if (result.kind === 'timeout') return 'accepted';
-      if (result.kind === 'gone') return 'unavailable';
-      const { reason, details } = result.refusal;
-      if (reason === DAEMON_SHUTTING_DOWN_REASON) return 'accepted';
-      if (reason === DAEMON_LIFECYCLE_REASONS.ownerEmbedded) return 'embedded-owner';
-      if (reason === DAEMON_LIFECYCLE_REASONS.busy && isStartingUpCensus(details)) {
-        const remaining = deadline - Date.now();
-        if (remaining > 0) {
-          await sleep(Math.min(SHUTDOWN_STARTUP_RETRY_DELAY_MS, remaining));
-          continue;
-        }
-      }
-      return 'unavailable';
+      const outcome = await requestDaemonShutdownAttempt(fencedInfo, target, timeoutMs);
+      if (outcome !== 'retry-startup') return outcome;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return 'unavailable';
+      await sleep(Math.min(SHUTDOWN_STARTUP_RETRY_DELAY_MS, remaining));
     }
   };
+}
+
+type ShutdownAttemptOutcome = 'accepted' | 'embedded-owner' | 'unavailable' | 'retry-startup';
+
+function fenceDaemonInfo(info: DaemonInfo, identity: DaemonProcessIdentity): DaemonInfo {
+  if (info.pid === identity.pid && info.processStartTime === identity.startTime) return info;
+  return { ...info, pid: identity.pid, processStartTime: identity.startTime ?? undefined };
+}
+
+async function requestDaemonShutdownAttempt(
+  fencedInfo: DaemonInfo,
+  target: DaemonLifecycleTarget,
+  timeoutMs: number,
+): Promise<ShutdownAttemptOutcome> {
+  const request = buildDaemonShutdownRequest({
+    token: fencedInfo.token,
+    fence: { pid: fencedInfo.pid, processStartTime: fencedInfo.processStartTime ?? null },
+    requestId: createRequestId(),
+  });
+  const result = await sendControlRequest(
+    fencedInfo,
+    request,
+    target,
+    timeoutMs,
+    readAppErrorRefusal,
+  );
+  if (result.kind === 'ok') return isDrainingOutcome(result.data) ? 'accepted' : 'unavailable';
+  // A slow daemon may already have accepted shutdown past the RPC timeout; let the caller wait
+  // its drain grace window before escalating to OS signals.
+  if (result.kind === 'timeout') return 'accepted';
+  if (result.kind === 'gone') return 'unavailable';
+  const { reason, details } = result.refusal;
+  if (reason === DAEMON_SHUTTING_DOWN_REASON) return 'accepted';
+  if (reason === DAEMON_LIFECYCLE_REASONS.ownerEmbedded) return 'embedded-owner';
+  if (reason === DAEMON_LIFECYCLE_REASONS.busy && isStartingUpCensus(details)) {
+    return 'retry-startup';
+  }
+  return 'unavailable';
 }
 
 function isDrainingOutcome(data: unknown): boolean {

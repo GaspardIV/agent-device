@@ -178,21 +178,12 @@ async function stopDaemonGracefully(
   options: { termTimeoutMs: number; gracefulShutdown?: DaemonGracefulShutdown },
 ): Promise<DaemonTerminationResult | Readonly<{ status: 'survived'; previousGraceful: boolean }>> {
   if (options.gracefulShutdown) {
-    if (!isAgentDeviceDaemonProcess(identity.pid, identity.startTime)) {
-      return (await waitForDaemonExit(identity, { timeoutMs: 0 })).exited
-        ? { status: 'exited', identity, mode: 'already-exited' }
-        : { status: 'retained', reason: 'identity-unverified' };
-    }
-    const outcome = await options.gracefulShutdown(identity);
-    if (outcome === 'embedded-owner') return { status: 'retained', reason: 'embedded-owner' };
-    if (outcome === 'accepted') {
-      return (await waitForDaemonExit(identity, { timeoutMs: options.termTimeoutMs })).exited
-        ? { status: 'exited', identity, mode: 'graceful' }
-        : { status: 'survived', previousGraceful: true };
-    }
-    if ((await waitForDaemonExit(identity, { timeoutMs: 0 })).exited) {
-      return { status: 'exited', identity, mode: 'already-exited' };
-    }
+    const rpcResult = await tryGracefulShutdownRpc(
+      identity,
+      options.gracefulShutdown,
+      options.termTimeoutMs,
+    );
+    if (rpcResult) return rpcResult;
   }
   const term = await signalAndWaitForDaemonExit(identity, {
     signal: 'SIGTERM',
@@ -201,6 +192,30 @@ async function stopDaemonGracefully(
   return term.status === 'survived'
     ? { status: 'survived', previousGraceful: canSignalGracefully() }
     : term;
+}
+
+async function tryGracefulShutdownRpc(
+  identity: DaemonProcessIdentity,
+  gracefulShutdown: DaemonGracefulShutdown,
+  termTimeoutMs: number,
+): Promise<
+  DaemonTerminationResult | Readonly<{ status: 'survived'; previousGraceful: boolean }> | null
+> {
+  if (!isAgentDeviceDaemonProcess(identity.pid, identity.startTime)) {
+    return (await waitForDaemonExit(identity, { timeoutMs: 0 })).exited
+      ? { status: 'exited', identity, mode: 'already-exited' }
+      : { status: 'retained', reason: 'identity-unverified' };
+  }
+  const outcome = await gracefulShutdown(identity);
+  if (outcome === 'embedded-owner') return { status: 'retained', reason: 'embedded-owner' };
+  if (outcome === 'accepted') {
+    return (await waitForDaemonExit(identity, { timeoutMs: termTimeoutMs })).exited
+      ? { status: 'exited', identity, mode: 'graceful' }
+      : { status: 'survived', previousGraceful: true };
+  }
+  return (await waitForDaemonExit(identity, { timeoutMs: 0 })).exited
+    ? { status: 'exited', identity, mode: 'already-exited' }
+    : null;
 }
 
 async function signalAndWaitForDaemonExit(
