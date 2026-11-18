@@ -116,15 +116,16 @@ export async function requestDaemonLifecycle(
 
 /**
  * Asks a fenced detached daemon to shut down gracefully over IPC/HTTP without waiting for
- * idle-only admission. Returns `undefined` when `info` predates `shutdown`, has a non-detached
- * owner, or lacks an endpoint/token.
+ * idle-only admission. Returns `undefined` when `mode === 'force'`, `info` predates `shutdown`,
+ * has a non-detached owner, or lacks an endpoint/token.
  */
 export function createGracefulDaemonShutdown(
-  info: DaemonInfo,
+  info: DaemonInfo | null | undefined,
   target: DaemonLifecycleTarget,
-  options?: { timeoutMs?: number },
+  options?: { mode?: 'graceful' | 'force'; timeoutMs?: number },
 ): DaemonGracefulShutdown | undefined {
-  if (info.ownership && info.ownership !== 'detached') return undefined;
+  if (options?.mode === 'force') return undefined;
+  if (!info || (info.ownership && info.ownership !== 'detached')) return undefined;
   if (!info.capabilities?.includes('shutdown')) return undefined;
   if (!info.token || (info.port === undefined && info.httpPort === undefined)) return undefined;
   return async (identity) => {
@@ -148,7 +149,10 @@ export function createGracefulDaemonShutdown(
         readAppErrorRefusal,
       );
       if (result.kind === 'ok') return isDrainingOutcome(result.data) ? 'accepted' : 'unavailable';
-      if (result.kind === 'gone' || result.kind === 'timeout') return 'unavailable';
+      // A slow daemon may already have accepted shutdown past the RPC timeout; let the caller wait
+      // its drain grace window before escalating to OS signals.
+      if (result.kind === 'timeout') return 'accepted';
+      if (result.kind === 'gone') return 'unavailable';
       const { reason, details } = result.refusal;
       if (reason === DAEMON_SHUTTING_DOWN_REASON) return 'accepted';
       if (reason === DAEMON_LIFECYCLE_REASONS.ownerEmbedded) return 'embedded-owner';

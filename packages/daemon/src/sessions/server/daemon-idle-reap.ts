@@ -234,7 +234,10 @@ export function createDaemonLifecycleAdmission(params: {
     // host that owns the state directory may retire the daemon on it.
     if (req.internal?.publicNetworkOnly) {
       return refuse(
-        new AppError('UNAUTHORIZED', 'Daemon quiesce is not available to remote clients.'),
+        new AppError(
+          'UNAUTHORIZED',
+          `Daemon ${options.requireIdle ? 'quiesce' : 'shutdown'} is not available to remote clients.`,
+        ),
       );
     }
     const fence = readDaemonLifecycleFence(req.input);

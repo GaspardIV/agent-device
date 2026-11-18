@@ -150,68 +150,56 @@ test.skipIf(process.getuid?.() === 0)(
   },
 );
 
-test('readDaemonStopIdentity captures endpoint metadata only for detached records with valid port and token', () => {
+test('readDaemonStopIdentity carries the raw readable record only when daemon.json is present', () => {
   const infoPath = infoPathOf(useStateDir());
 
-  fs.writeFileSync(
-    infoPath,
-    JSON.stringify({
-      pid: 4242,
-      processStartTime: 'start',
-      ownership: 'detached',
-      port: 4310,
-      httpPort: 4311,
-      transport: 'dual',
-      token: 'secret-token',
-      capabilities: ['quiesce', 'shutdown'],
-    }),
-  );
+  assert.deepEqual(readDaemonStopIdentity(infoPath), {
+    ownership: 'absent',
+    identity: null,
+  });
+
+  const fullRecord = {
+    pid: 4242,
+    processStartTime: 'start',
+    ownership: 'detached',
+    port: 4310,
+    httpPort: 4311,
+    transport: 'dual',
+    token: 'secret-token',
+    capabilities: ['quiesce', 'shutdown'],
+  };
+  fs.writeFileSync(infoPath, JSON.stringify(fullRecord));
   assert.deepEqual(readDaemonStopIdentity(infoPath), {
     ownership: 'detached',
     identity: { pid: 4242, startTime: 'start' },
-    endpoint: {
-      port: 4310,
-      httpPort: 4311,
-      transport: 'dual',
-      token: 'secret-token',
-      capabilities: ['quiesce', 'shutdown'],
-    },
+    record: fullRecord,
   });
 
-  fs.writeFileSync(
-    infoPath,
-    JSON.stringify({
-      pid: 4242,
-      processStartTime: 'start',
-      ownership: 'detached',
-      port: 70_000,
-      token: 'secret-token',
-      capabilities: ['shutdown'],
-    }),
-  );
-  assert.deepEqual(readDaemonStopIdentity(infoPath), {
-    ownership: 'detached',
-    identity: { pid: 4242, startTime: 'start' },
-  });
-
-  fs.writeFileSync(
-    infoPath,
-    JSON.stringify({
-      pid: 4242,
-      processStartTime: 'start',
-      ownership: 'embedded',
-      port: 4310,
-      token: 'secret-token',
-    }),
-  );
+  const embeddedRecord = {
+    pid: 4242,
+    processStartTime: 'start',
+    ownership: 'embedded',
+    port: 4310,
+    token: 'secret-token',
+  };
+  fs.writeFileSync(infoPath, JSON.stringify(embeddedRecord));
   assert.deepEqual(readDaemonStopIdentity(infoPath), {
     ownership: 'embedded',
     identity: { pid: 4242, startTime: 'start' },
+    record: embeddedRecord,
   });
 
-  fs.writeFileSync(infoPath, JSON.stringify({ pid: 4242, processStartTime: 'start' }));
+  const minimalRecord = { pid: 4242, processStartTime: 'start' };
+  fs.writeFileSync(infoPath, JSON.stringify(minimalRecord));
   assert.deepEqual(readDaemonStopIdentity(infoPath), {
     ownership: 'detached',
     identity: { pid: 4242, startTime: 'start' },
+    record: minimalRecord,
+  });
+
+  fs.writeFileSync(infoPath, '{not json');
+  assert.deepEqual(readDaemonStopIdentity(infoPath), {
+    ownership: 'unreadable',
+    identity: null,
   });
 });

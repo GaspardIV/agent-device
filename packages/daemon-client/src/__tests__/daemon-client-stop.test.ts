@@ -15,6 +15,8 @@ import {
 } from '@agent-device/daemon-contracts/daemon-resolution';
 import { readDaemonStopIdentity } from '@agent-device/daemon-contracts/daemon-registration';
 import { resolveDaemonShutdownReportPath } from '@agent-device/daemon-contracts/daemon-shutdown-report';
+import { readDaemonInfo } from '../daemon-client-metadata.ts';
+import { stopDaemonForTakeover } from '../daemon-client-startup.ts';
 import { stopRecordedDaemon } from '../daemon-client-stop.ts';
 import * as transport from '../daemon-client-transport.ts';
 
@@ -431,6 +433,121 @@ server.listen(0, '127.0.0.1', () => {
       });
       expect(signals.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([]);
       expect(fs.readFileSync(paths.infoPath, 'utf8')).toBe(record);
+    },
+  );
+});
+
+test('stopRecordedDaemon waits the drain grace window instead of signalling when shutdown RPC times out', async () => {
+  await withMockStopDaemon(
+    'agent-device-stop-timeout-rpc-',
+    'http',
+    ({ infoPath, reportPath }) => `import fs from 'node:fs';
+import http from 'node:http';
+const infoPath = ${JSON.stringify(infoPath)};
+const reportPath = ${JSON.stringify(reportPath)};
+const server = http.createServer((_req, _res) => {
+  // Simulate a daemon that accepted shutdown and is draining slowly past the 2s RPC timeout.
+  setTimeout(() => {
+    fs.writeFileSync(reportPath, JSON.stringify({
+      providerReleases: { released: [], pending: [] },
+      claims: { released: [], orphaned: [], superseded: [], unattributable: [] },
+    }) + '\\n');
+    fs.rmSync(infoPath, { force: true });
+    server.closeAllConnections();
+    server.close(() => process.exit(0));
+  }, 2300);
+});
+server.listen(0, '127.0.0.1', () => {
+  console.log(JSON.stringify({ port: server.address().port, token: 'slow-token' }));
+});`,
+    async ({ paths, daemon }) => {
+      const signals = vi.spyOn(process, 'kill');
+      const exited = once(daemon, 'exit');
+      const result = await stopRecordedDaemon(readDaemonStopIdentity(paths.infoPath), {
+        paths,
+        host: createTestHostEnvironment(),
+      });
+      const [exitCode] = await exited;
+
+      expect(exitCode).toBe(0);
+      expect(signals.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([]);
+      expect(result.mode).toBe('graceful');
+    },
+  );
+});
+
+test('stopDaemonForTakeover uses graceful shutdown RPC in graceful mode and skips it in force mode', async () => {
+  await withMockStopDaemon(
+    'agent-device-takeover-graceful-rpc-',
+    'http',
+    ({ infoPath }) => `import fs from 'node:fs';
+import http from 'node:http';
+const infoPath = ${JSON.stringify(infoPath)};
+const server = http.createServer((req, res) => {
+  let body = '';
+  req.setEncoding('utf8');
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    const rpc = JSON.parse(body);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({ jsonrpc: '2.0', id: rpc.id ?? null, result: { ok: true, data: { outcome: 'draining' } } }),
+      () => {
+        fs.rmSync(infoPath, { force: true });
+        server.close(() => process.exit(0));
+      },
+    );
+  });
+});
+server.listen(0, '127.0.0.1', () => {
+  console.log(JSON.stringify({ port: server.address().port, token: 'takeover-token' }));
+});`,
+    async ({ paths, daemon }) => {
+      const info = readDaemonInfo(paths.infoPath);
+      expect(info).toBeTruthy();
+      const signals = vi.spyOn(process, 'kill');
+      const exited = once(daemon, 'exit');
+      const retirement = await stopDaemonForTakeover(
+        info!,
+        paths,
+        'graceful',
+        createTestHostEnvironment(),
+      );
+      const [exitCode] = await exited;
+
+      expect(exitCode).toBe(0);
+      expect(signals.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([]);
+      expect(retirement.status).toBe('retired');
+      if (retirement.status === 'retired') {
+        expect(retirement.termination.mode).toBe('graceful');
+      }
+    },
+  );
+
+  await withMockStopDaemon(
+    'agent-device-takeover-force-rpc-',
+    'http',
+    () => `import http from 'node:http';
+const server = http.createServer(() => {});
+server.listen(0, '127.0.0.1', () => {
+  console.log(JSON.stringify({ port: server.address().port, token: 'force-token' }));
+});
+setInterval(() => {}, 1000);`,
+    async ({ paths }) => {
+      const info = readDaemonInfo(paths.infoPath);
+      expect(info).toBeTruthy();
+      const send = vi.spyOn(transport, 'sendRequest');
+      const retirement = await stopDaemonForTakeover(
+        info!,
+        paths,
+        'force',
+        createTestHostEnvironment(),
+      );
+      expect(send).not.toHaveBeenCalled();
+      expect(retirement.status).toBe('retired');
+      if (retirement.status === 'retired') {
+        expect(retirement.termination.mode).toBe('forced');
+      }
     },
   );
 });

@@ -123,7 +123,7 @@ export function readDaemonInfo(infoPath: string): DaemonInfo | null {
   return parseDaemonInfo(read.record);
 }
 
-function parseDaemonInfo(parsed: Readonly<Record<string, unknown>>): DaemonInfo | null {
+export function parseDaemonInfo(parsed: Readonly<Record<string, unknown>>): DaemonInfo | null {
   const token = readRequiredDaemonToken(parsed);
   const ports = readDaemonInfoPorts(parsed);
   const pid = parsed.pid;

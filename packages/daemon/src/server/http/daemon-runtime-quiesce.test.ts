@@ -486,6 +486,7 @@ test('a quiesce that arrives as a remote-origin HTTP request is refused', async 
   try {
     const body = await quiesceOverHttp(daemon, { 'x-agent-device-network-access': 'public-only' });
     expect(JSON.stringify(body)).toContain('"UNAUTHORIZED"');
+    expect(JSON.stringify(body)).toContain('Daemon quiesce is not available to remote clients.');
     expect((await daemon.sessionList()).ok).toBe(true);
   } finally {
     await daemon.runtime.close();
@@ -676,6 +677,7 @@ test('shutdown accepts active sessions and leases, writes the shutdown report, a
       buildDaemonShutdownRequest,
     );
     expect(JSON.stringify(body)).toContain('"UNAUTHORIZED"');
+    expect(JSON.stringify(body)).toContain('Daemon shutdown is not available to remote clients.');
     expect(reasonOf(await remote.shutdown({ processStartTime: 'other-start' }))).toBe(
       'daemon-instance-mismatch',
     );

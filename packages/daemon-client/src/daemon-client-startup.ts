@@ -36,6 +36,7 @@ import {
   type DaemonInfo,
 } from './daemon-client-metadata.ts';
 import { canConnect, isDaemonTransportUnavailableError } from './daemon-client-transport.ts';
+import { createGracefulDaemonShutdown } from './daemon-client-lifecycle-request.ts';
 import {
   daemonContendedError,
   daemonTakeoverRetirementError,
@@ -142,7 +143,7 @@ export async function readReusableLocalDaemon(
 
   if (remainingStartupBudget(deadline) < MINIMUM_DAEMON_TAKEOVER_BUDGET_MS) return null;
   emitDaemonTakeoverNotice(existing, decision.reason, settings.paths.baseDir);
-  await retireDaemonForTakeover(existing, settings.paths);
+  await retireDaemonForTakeover(existing, settings.paths, 'graceful', settings.host);
   return null;
 }
 
@@ -159,11 +160,18 @@ export async function stopDaemonForTakeover(
   existing: DaemonInfo,
   paths: DaemonPaths,
   mode: 'graceful' | 'force' = 'graceful',
+  host?: HostEnvironment,
 ): Promise<DaemonRetirementResult> {
+  // Optional `host` preserves callers like unreachable-daemon replacement (`replaceUnreachable`, already
+  // known non-responsive on probes) and existing tests without firing RPCs or breaking R86 process-global rules.
+  const gracefulShutdown = host
+    ? createGracefulDaemonShutdown(existing, { paths, host }, { mode })
+    : undefined;
   return await stopAndRetireDaemon({
     paths: paths,
     observed: observedDaemonIdentityOf(existing),
     mode,
+    ...(gracefulShutdown ? { gracefulShutdown } : {}),
   });
 }
 
@@ -171,8 +179,9 @@ export async function retireDaemonForTakeover(
   existing: DaemonInfo,
   paths: DaemonPaths,
   mode: 'graceful' | 'force' = 'graceful',
+  host?: HostEnvironment,
 ): Promise<void> {
-  const retirement = await stopDaemonForTakeover(existing, paths, mode);
+  const retirement = await stopDaemonForTakeover(existing, paths, mode, host);
   if (retirement.status === 'retained')
     throw daemonTakeoverRetirementError(retirement, existing, paths);
 }
